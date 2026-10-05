@@ -55,7 +55,8 @@ const P = {
   updaterCache: join(LOCALAPPDATA, "riftlauncher-updater")
 }
 const INFO_LOG = join(P.userData, "Logs", "info.log")
-const PORT = 9250
+/** One DevTools port per launch: the installer the launcher spawns inherits its listening socket and keeps the port while it runs. */
+let port = 9250
 const NEW_VERSION = "1.7.0"
 const OLD_VERSION = "1.7.0-beta.13"
 
@@ -145,7 +146,7 @@ function desktopShot(label) {
 }
 
 function cdp(...args) {
-  const r = spawnSync(process.execPath, [P.cdp, ...args], { encoding: "utf8", timeout: 45_000, windowsHide: true, env: { ...process.env, CDP_PORT: String(PORT) } })
+  const r = spawnSync(process.execPath, [P.cdp, ...args], { encoding: "utf8", timeout: 45_000, windowsHide: true, env: { ...process.env, CDP_PORT: String(port) } })
   return { ok: r.status === 0, out: (r.stdout || "").trim(), err: (r.stderr || r.error?.message || "").trim() }
 }
 function cdpEval(expression) {
@@ -344,13 +345,14 @@ function seedProfile() {
 // --- launcher --------------------------------------------------------------------------------
 
 async function launch(label) {
+  port += 1
   const out = openSync(join(EVIDENCE, `app-${label}.log`), "a")
-  const child = spawn(state.exe, [`--remote-debugging-port=${PORT}`], { detached: true, stdio: ["ignore", out, out] })
+  const child = spawn(state.exe, [`--remote-debugging-port=${port}`], { detached: true, stdio: ["ignore", out, out] })
   child.unref()
   closeSync(out)
-  log(`${label}: started the installed RiftLauncher.exe (pid ${child.pid}) with --remote-debugging-port=${PORT}, UPDATE unset`)
+  log(`${label}: started the installed RiftLauncher.exe (pid ${child.pid}) with --remote-debugging-port=${port}, UPDATE unset`)
   const target = await until(async () => {
-    const res = await fetch(`http://127.0.0.1:${PORT}/json/list`, { signal: AbortSignal.timeout(3000) })
+    const res = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(3000) })
     return (await res.json()).find((t) => t.type === "page" && String(t.url).startsWith("app://"))
   }, 90_000)
   if (!target) throw new Error(`${label}: no app:// page on the DevTools port within 90 s`)
@@ -485,21 +487,25 @@ async function stopWatcher(watcher) {
   writeFileSync(watcher.stopFile, "stop")
   const exited = await until(() => watcher.child.exitCode !== null, 20_000, 500)
   if (!exited) watcher.child.kill()
-  // What showed on screen while it watched, apart from the desktop's own windows.
-  const seen = new Set()
+  // What showed up on screen while it watched that was not there when it started, by process.
+  const appeared = new Set()
+  let baseline = null
   try {
     for (const line of readFileSync(join(watcher.dir, "watch.jsonl"), "utf8").split("\n")) {
       if (!line.trim()) continue
-      for (const w of JSON.parse(line).windows ?? []) {
-        const [, process, cls, title] = w.split("|")
-        if (/^(explorer|TextInputHost|ShellExperienceHost|StartMenuExperienceHost|SearchHost|ApplicationFrameHost|SystemSettings|ctfmon)$/i.test(process)) continue
-        seen.add(`${process} | ${cls} | ${title}`)
-      }
+      const windows = JSON.parse(line).windows
+      if (!windows) continue
+      const keys = windows.map((w) => {
+        const [pid, process, cls, title] = w.split("|")
+        return `${process} (pid ${pid}) | ${cls} | ${title}`
+      })
+      if (baseline === null) baseline = new Set(keys)
+      else for (const k of keys) if (!baseline.has(k)) appeared.add(k)
     }
   } catch (error) {
     report.errors.push(`watch log of ${watcher.dir}: ${error.message}`)
   }
-  return [...seen]
+  return [...appeared]
 }
 
 async function closeLauncher(label) {
@@ -516,16 +522,16 @@ async function closeLauncher(label) {
   return { closed: Boolean(gone), sent }
 }
 
-function pageSignature(ui) {
-  return (ui ?? [])
-    .map((w) => `${w.title}::${(w.items ?? []).filter((i) => !i.offscreen && /^(Text|Button|RadioButton|CheckBox|Edit)$/.test(i.type)).map((i) => `${i.type}:${i.name}:${i.enabled}:${i.state ?? ""}`).join(";")}`)
-    .join("||")
+/** What is on the installer's screen: the text and state of every visible control. */
+function pageSignature(controls) {
+  return (controls ?? [])
+    .filter((c) => c.Visible && c.Text)
+    .map((c) => `${c.Class}:${c.Text.replace(/\s+/g, " ").trim()}${c.Enabled ? "" : " (disabled)"}${c.Check === 1 ? " [checked]" : ""}`)
+    .join(" | ")
 }
-function playerButton(ui) {
+function playerButton(controls) {
   for (const name of INSTALLER_BUTTONS) {
-    for (const w of ui ?? []) {
-      if ((w.items ?? []).some((i) => i.type === "Button" && i.enabled && !i.offscreen && i.name.replace(/&/g, "") === name)) return name
-    }
+    if ((controls ?? []).some((c) => c.Class === "Button" && c.Visible && c.Enabled && c.Text.replace(/&/g, "") === name)) return name
   }
   return null
 }
@@ -582,20 +588,20 @@ async function followInstaller(label, oldPids, startedAt, { waitForPlayer, deadl
       log(`${label}: a new launcher process runs from the install folder after ${at()} s: ${fresh.cmd}`)
       desktopShot(`${label}-new-launcher-up`)
     }
-    const ui = installer ? tryPs("uia", String(installer.pid)) : null
+    const ui = installer ? tryPs("controls", String(installer.pid)) : null
     if (ui) {
       const signature = pageSignature(ui)
       if (signature !== lastSignature) {
         lastSignature = signature
         pageSince = Date.now()
         const shot = desktopShot(`${label}-installer-${seen.pages.length + 1}`)
-        seen.pages.push({ atS: at(), shot, windows: ui })
-        log(`${label}: installer window ${seen.pages.length}: ${signature.slice(0, 600) || "(no window)"}`)
+        seen.pages.push({ atS: at(), shot, screen: signature, controls: ui })
+        log(`${label}: installer screen ${seen.pages.length}: ${signature.slice(0, 900) || "(no window)"}`)
       } else if (waitForPlayer && !oldAlive && Date.now() - pageSince >= PLAYER_PAUSE_MS && seen.presses.length < 6) {
         const name = playerButton(ui)
         if (name) {
           const shot = desktopShot(`${label}-installer-waiting-${seen.presses.length + 1}`)
-          const pressed = tryPs("invoke", String(installer.pid), name)
+          const pressed = tryPs("press", String(installer.pid), name)
           seen.presses.push({ atS: at(), button: name, waitedS: Number(((Date.now() - pageSince) / 1000).toFixed(1)), shot, pressed })
           log(`${label}: the installer had waited ${seen.presses.at(-1).waitedS} s on its page; pressed "${name}" as a player would`, pressed)
           pageSince = Date.now()
@@ -629,8 +635,8 @@ function installState(label) {
   log(`${label}: exe ProductVersion ${exe?.productVersion}, FileVersion ${exe?.fileVersion}, HKCU DisplayVersion ${displayVersion}, HKLM entries ${reg?.hklmUninstall?.length ?? "?"}`)
   return { reg, exe, displayVersion }
 }
-/** The exe's ProductVersion (electron-builder may pad it to four parts) and the uninstall entry's DisplayVersion both say `v`. */
-const isVersion = (s, v) => Boolean(s?.exe?.exists) && s.displayVersion === v && [v, `${v}.0`].includes(s.exe.productVersion)
+/** The exe's FileVersion and the uninstall entry's DisplayVersion both say `v`. Its ProductVersion is 1.7.0.0 for the beta and the stable alike. */
+const isVersion = (s, v) => Boolean(s?.exe?.exists) && s.displayVersion === v && s.exe.fileVersion === v
 
 // --- scenarios -------------------------------------------------------------------------------
 

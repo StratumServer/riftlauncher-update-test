@@ -10,13 +10,13 @@
 #   procs                                 launcher, installer, uninstaller and running-app-check processes
 #   reg                                   the launcher's uninstall and install registry entries
 #   ver     -Target <exe>                 version resource, size and hash of a file
-#   uia     -Target <pid>                 controls of every top-level window of one process
-#   invoke  -Target <pid> -Name <button>  press one installer button: Next >, Install or Finish only
+#   controls -Target <pid>                every control of every visible top-level window of one process
+#   press   -Target <pid> -Name <button>  press one installer button: Next >, Install or Finish only
 #   close   -Target <pid>                 send WM_CLOSE to that process's visible top-level windows
 #   watch   -Target <folder> -Name <stop file>
 param(
   [Parameter(Mandatory = $true)]
-  [ValidateSet("shot", "windows", "minimize", "procs", "reg", "ver", "uia", "invoke", "close", "watch")]
+  [ValidateSet("shot", "windows", "minimize", "procs", "reg", "ver", "controls", "press", "close", "watch")]
   [string]$Action,
   [string]$Target = "",
   [string]$Name = ""
@@ -45,10 +45,32 @@ public class RlutWindow
     public bool Owned { get; set; }
 }
 
+public class RlutControl
+{
+    public long Hwnd { get; set; }
+    public long Parent { get; set; }
+    public int Id { get; set; }
+    public string Class { get; set; }
+    public string Text { get; set; }
+    public bool Visible { get; set; }
+    public bool Enabled { get; set; }
+    public int Check { get; set; }
+}
+
 public static class RlutWin
 {
     private delegate bool EnumProc(IntPtr hwnd, IntPtr lParam);
     [DllImport("user32.dll")] private static extern bool EnumWindows(EnumProc callback, IntPtr lParam);
+    [DllImport("user32.dll")] private static extern bool EnumChildWindows(IntPtr parent, EnumProc callback, IntPtr lParam);
+    [DllImport("user32.dll")] private static extern bool IsWindowEnabled(IntPtr hwnd);
+    [DllImport("user32.dll")] private static extern int GetDlgCtrlID(IntPtr hwnd);
+    [DllImport("user32.dll")] private static extern IntPtr GetParent(IntPtr hwnd);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, IntPtr wParam, StringBuilder lParam, uint flags, uint timeout, out IntPtr result);
+    [DllImport("user32.dll")] private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
+    private const uint WM_GETTEXT = 0x000D;
+    private const uint WM_COMMAND = 0x0111;
+    private const uint BM_GETCHECK = 0x00F0;
+    private const uint SMTO_ABORTIFHUNG = 0x0002;
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hwnd);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr hwnd, StringBuilder text, int max);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hwnd, StringBuilder text, int max);
@@ -101,6 +123,52 @@ public static class RlutWin
             count++;
         }
         return count;
+    }
+
+    // Window text through WM_GETTEXT, which works across processes where GetWindowText does not, and
+    // the check state of anything of class Button (radio buttons and checkboxes are Buttons too).
+    private static RlutControl Describe(IntPtr h)
+    {
+        var cls = new StringBuilder(256);
+        GetClassName(h, cls, cls.Capacity);
+        var text = new StringBuilder(2048);
+        IntPtr ignored;
+        SendMessageTimeout(h, WM_GETTEXT, new IntPtr(text.Capacity), text, SMTO_ABORTIFHUNG, 2000, out ignored);
+        int check = -1;
+        if (cls.ToString() == "Button")
+        {
+            IntPtr state;
+            if (SendMessageTimeout(h, BM_GETCHECK, IntPtr.Zero, IntPtr.Zero, SMTO_ABORTIFHUNG, 2000, out state) != IntPtr.Zero) check = state.ToInt32();
+        }
+        return new RlutControl
+        {
+            Hwnd = h.ToInt64(), Parent = GetParent(h).ToInt64(), Id = GetDlgCtrlID(h), Class = cls.ToString(), Text = text.ToString(),
+            Visible = IsWindowVisible(h), Enabled = IsWindowEnabled(h), Check = check
+        };
+    }
+
+    // Every visible top-level window of one process, each followed by all of its child controls.
+    public static List<RlutControl> Controls(uint pid)
+    {
+        var list = new List<RlutControl>();
+        foreach (var w in Visible())
+        {
+            if (w.Pid != pid) continue;
+            var top = new IntPtr(w.Hwnd);
+            list.Add(Describe(top));
+            EnumChildWindows(top, delegate (IntPtr h, IntPtr l) { list.Add(Describe(h)); return true; }, IntPtr.Zero);
+        }
+        return list;
+    }
+
+    // What a click on a push button tells its dialog: WM_COMMAND with the button's id and BN_CLICKED (0).
+    public static bool Press(long hwnd)
+    {
+        var h = new IntPtr(hwnd);
+        var cls = new StringBuilder(256);
+        GetClassName(h, cls, cls.Capacity);
+        if (cls.ToString() != "Button" || !IsWindowVisible(h) || !IsWindowEnabled(h)) return false;
+        return PostMessage(GetParent(h), WM_COMMAND, new IntPtr(GetDlgCtrlID(h) & 0xFFFF), h);
     }
 
     // The message a window's own close button ends in, sent to every visible unowned top-level
@@ -172,36 +240,6 @@ function Read-Key([string]$Path) {
   }
 }
 
-function Get-UiaWindows([int]$ProcessId) {
-  Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
-  $ae = [System.Windows.Automation.AutomationElement]
-  $condition = New-Object System.Windows.Automation.PropertyCondition($ae::ProcessIdProperty, $ProcessId)
-  $windows = $ae::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children, $condition)
-  foreach ($w in $windows) {
-    $items = New-Object System.Collections.Generic.List[object]
-    $all = $w.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-    foreach ($e in $all) {
-      $c = $e.Current
-      if ([string]::IsNullOrWhiteSpace($c.Name)) { continue }
-      $state = $null
-      $pattern = $null
-      if ($e.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) {
-        $state = $pattern.Current.ToggleState.ToString()
-      } elseif ($e.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$pattern)) {
-        $state = if ($pattern.Current.IsSelected) { "Selected" } else { "NotSelected" }
-      }
-      $items.Add([ordered]@{
-        type = ($c.ControlType.ProgrammaticName -replace '^ControlType\.', '')
-        name = $c.Name
-        enabled = $c.IsEnabled
-        offscreen = $c.IsOffscreen
-        state = $state
-      })
-    }
-    [ordered]@{ title = $w.Current.Name; cls = $w.Current.ClassName; hwnd = $w.Current.NativeWindowHandle; items = $items.ToArray() }
-  }
-}
-
 switch ($Action) {
   "shot" {
     Out-Json ([ordered]@{ path = $Target; screen = (Save-Shot $Target) })
@@ -258,29 +296,19 @@ switch ($Action) {
       sha256 = $hash
     })
   }
-  "uia" {
-    Out-Json @(Get-UiaWindows ([int]$Target))
+  "controls" {
+    Use-Native
+    Out-Json @([RlutWin]::Controls([uint32]$Target))
   }
-  "invoke" {
+  "press" {
     # The installer's own forward buttons, the ones a player presses to get through it. Never Back,
     # Cancel, a radio button or a checkbox: the page is left exactly as the installer set it up.
     $allowed = @("Next >", "Install", "Finish")
     if ($allowed -notcontains $Name) { throw "refusing to press '$Name': only $($allowed -join ', ') may be pressed" }
-    Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
-    $ae = [System.Windows.Automation.AutomationElement]
-    $condition = New-Object System.Windows.Automation.PropertyCondition($ae::ProcessIdProperty, [int]$Target)
-    $pressed = $null
-    foreach ($w in $ae::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children, $condition)) {
-      $buttonCondition = New-Object System.Windows.Automation.PropertyCondition($ae::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
-      foreach ($b in $w.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttonCondition)) {
-        if (($b.Current.Name -replace '&', '') -ne $Name -or -not $b.Current.IsEnabled -or $b.Current.IsOffscreen) { continue }
-        $b.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
-        $pressed = [ordered]@{ window = $w.Current.Name; button = $b.Current.Name }
-        break
-      }
-      if ($pressed) { break }
-    }
-    Out-Json ([ordered]@{ invoked = [bool]$pressed; pressed = $pressed })
+    Use-Native
+    $button = [RlutWin]::Controls([uint32]$Target) | Where-Object { $_.Class -eq "Button" -and $_.Visible -and $_.Enabled -and ($_.Text -replace '&', '') -eq $Name } | Select-Object -First 1
+    $pressed = if ($button) { [RlutWin]::Press($button.Hwnd) } else { $false }
+    Out-Json ([ordered]@{ pressed = $pressed; button = $button })
   }
   "close" {
     Use-Native
