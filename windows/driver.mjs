@@ -472,6 +472,32 @@ function verifyPending() {
   return result
 }
 
+/** One process start and stop trace for the whole run (win.ps1 trace). */
+let trace = null
+function startTrace() {
+  const file = join(EVIDENCE, "process-trace.jsonl")
+  const stopFile = join(process.env.RUNNER_TEMP, "stop-trace")
+  const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", P.win, "-Action", "trace", "-Target", file, "-Name", stopFile], { stdio: "ignore", windowsHide: true, env: PS_ENV })
+  trace = { file, stopFile, child }
+}
+async function stopTrace() {
+  if (!trace) return
+  writeFileSync(trace.stopFile, "stop")
+  if (!(await until(() => trace.child.exitCode !== null, 15_000, 500))) trace.child.kill()
+}
+/** The traced starts and stops between two moments, a second of margin either side, after letting the trace catch up. */
+async function traceBetween(label, fromMs, toMs) {
+  await sleep(2000)
+  let entries = []
+  try {
+    entries = readFileSync(trace.file, "utf8").split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l)).filter((e) => e.t && Date.parse(e.t) >= fromMs - 1000 && Date.parse(e.t) <= toMs + 1000)
+  } catch (error) {
+    report.errors.push(`reading the process trace: ${error.message}`)
+  }
+  for (const e of entries) log(`${label}: trace ${e.t.slice(11, 23)} ${e.kind} ${e.name} pid ${e.pid} parent ${e.ppid}${e.kind === "stop" ? ` exit ${e.exitStatus}` : ""}${e.cmd ? `: ${e.cmd.slice(0, 260)}` : ""}`)
+  return entries
+}
+
 const watchers = new Set()
 function startWatcher(label) {
   const dir = join(EVIDENCE, `watch-${label}`)
@@ -683,6 +709,7 @@ async function restartScenario() {
   await safeClick(toastButton(ready.id, "Restart and update"), "Restart and update", { closesApp: true })
   const follow = await followInstaller("restart", oldPids, clickedAt, { waitForPlayer: true, deadlineMs: 300_000 })
   report.restart = follow
+  follow.processTrace = await traceBetween("restart", clickedAt, Date.now())
   if (follow.newLauncher) {
     const versionLine = await waitVersionLine(before)
     report.restart.versionLogLine = versionLine
@@ -784,6 +811,7 @@ async function closeAndFollow(label) {
   const sent = ps("close", String(main.pid))
   log(`${label}: asked the launcher window to close (WM_CLOSE to pid ${main.pid}, ${sent.closeMessagesSent} window(s)); not pressing Restart and update`)
   const follow = await followInstaller(label, oldPids, closedAt, { waitForPlayer: false, deadlineMs: 240_000 })
+  follow.processTrace = await traceBetween(label, closedAt, Date.now())
   follow.windowsSeen = await stopWatcher(watcher)
   follow.logAfterClose = updaterLines(logSince(before))
   follow.processesAfter = procs()
@@ -810,6 +838,7 @@ async function main() {
   } catch (error) {
     report.errors.push(`reading the releases feed: ${error.message}`)
   }
+  startTrace()
   await installOld()
   seedProfile()
   if (scenario === "defer") await deferScenario()
@@ -824,6 +853,7 @@ try {
   exitCode = 1
 } finally {
   for (const watcher of [...watchers]) await stopWatcher(watcher)
+  await stopTrace()
   try {
     if (existsSync(join(P.userData, "Logs"))) cpSync(join(P.userData, "Logs"), join(EVIDENCE, "logs"), { recursive: true })
     report.updaterCacheAtEnd = listing(P.updaterCache)

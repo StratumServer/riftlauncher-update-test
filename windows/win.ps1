@@ -14,9 +14,10 @@
 #   press   -Target <pid> -Name <button>  press one installer button: Next >, Install or Finish only
 #   close   -Target <pid>                 send WM_CLOSE to that process's visible top-level windows
 #   watch   -Target <folder> -Name <stop file>
+#   trace   -Target <jsonl file> -Name <stop file>   process starts and stops, with exit codes
 param(
   [Parameter(Mandatory = $true)]
-  [ValidateSet("shot", "windows", "minimize", "procs", "reg", "ver", "controls", "press", "close", "watch")]
+  [ValidateSet("shot", "windows", "minimize", "procs", "reg", "ver", "controls", "press", "close", "watch", "trace")]
   [string]$Action,
   [string]$Target = "",
   [string]$Name = ""
@@ -313,6 +314,54 @@ switch ($Action) {
   "close" {
     Use-Native
     Out-Json ([ordered]@{ pid = [int]$Target; closeMessagesSent = [RlutWin]::Close([uint32]$Target) })
+  }
+  "trace" {
+    # Every start and stop of the processes an update involves, as Windows reports them (WMI process
+    # traces need an elevated session, which the runner has). The installer's running-app check and
+    # the old version's uninstaller live for under a second, too short for any polling to see; the
+    # check's exit code is its answer (0: the launcher was still running).
+    $outFile = $Target
+    $stopFile = $Name
+    $interesting = '(?i)riftlauncher|^un_[a-z]\.exe$|^powershell\.exe$|^cmd\.exe$|^taskkill\.exe$|^tasklist\.exe$|^findstr\.exe$|^elevate\.exe$'
+    Register-CimIndicationEvent -ClassName Win32_ProcessStartTrace -SourceIdentifier RlutStart
+    Register-CimIndicationEvent -ClassName Win32_ProcessStopTrace -SourceIdentifier RlutStop
+    $tracked = @{}
+    $deadline = (Get-Date).AddMinutes(30)
+    while ((Get-Date) -lt $deadline -and -not (Test-Path -LiteralPath $stopFile)) {
+      $ev = Wait-Event -Timeout 1
+      if (-not $ev) { continue }
+      Remove-Event -EventIdentifier $ev.EventIdentifier
+      try {
+        $e = $ev.SourceEventArgs.NewEvent
+        $processId = [int]$e.ProcessID
+        $isStart = $ev.SourceIdentifier -eq 'RlutStart'
+        $cmd = $null
+        if ($isStart) {
+          if ([string]$e.ProcessName -notmatch $interesting) { continue }
+          $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$processId" -ErrorAction SilentlyContinue).CommandLine
+          # The driver's own probes are PowerShell too; they are not part of the update.
+          if ($cmd -and $cmd.Contains('\harness\windows\win.ps1')) { continue }
+          $tracked[$processId] = $true
+        } elseif (-not $tracked.ContainsKey($processId)) {
+          continue
+        }
+        $line = Out-Json ([ordered]@{
+          t = $ev.TimeGenerated.ToUniversalTime().ToString("o")
+          kind = if ($isStart) { "start" } else { "stop" }
+          name = [string]$e.ProcessName
+          pid = $processId
+          ppid = [int]$e.ParentProcessID
+          exitStatus = if ($isStart) { $null } else { [int64]$e.ExitStatus }
+          cmd = $cmd
+        })
+        [System.IO.File]::AppendAllText($outFile, $line + "`n")
+      } catch {
+        [System.IO.File]::AppendAllText($outFile, (Out-Json ([ordered]@{ t = (Get-Date).ToUniversalTime().ToString("o"); error = $_.Exception.Message })) + "`n")
+      }
+    }
+    Unregister-Event -SourceIdentifier RlutStart
+    Unregister-Event -SourceIdentifier RlutStop
+    Out-Json ([ordered]@{ done = $true })
   }
   "watch" {
     Use-Native
