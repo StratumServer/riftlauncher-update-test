@@ -6,6 +6,7 @@
 #
 #   shot    -Target <png>                 capture the whole desktop
 #   windows                               visible top-level windows
+#   minimize -Name <window class>         minimize the visible windows of that class
 #   procs                                 launcher, installer, uninstaller and running-app-check processes
 #   reg                                   the launcher's uninstall and install registry entries
 #   ver     -Target <exe>                 version resource, size and hash of a file
@@ -15,7 +16,7 @@
 #   watch   -Target <folder> -Name <stop file>
 param(
   [Parameter(Mandatory = $true)]
-  [ValidateSet("shot", "windows", "procs", "reg", "ver", "uia", "invoke", "close", "watch")]
+  [ValidateSet("shot", "windows", "minimize", "procs", "reg", "ver", "uia", "invoke", "close", "watch")]
   [string]$Action,
   [string]$Target = "",
   [string]$Name = ""
@@ -55,6 +56,7 @@ public static class RlutWin
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
     [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr hwnd, uint cmd);
     [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hwnd, int cmd);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct Rect { public int Left, Top, Right, Bottom; }
@@ -87,6 +89,18 @@ public static class RlutWin
             return true;
         }, IntPtr.Zero);
         return list;
+    }
+
+    public static int Minimize(string cls)
+    {
+        int count = 0;
+        foreach (var w in Visible())
+        {
+            if (w.Class != cls) continue;
+            ShowWindow(new IntPtr(w.Hwnd), 6);
+            count++;
+        }
+        return count;
     }
 
     // The message a window's own close button ends in, sent to every visible unowned top-level
@@ -196,6 +210,10 @@ switch ($Action) {
     Use-Native
     Out-Json @([RlutWin]::Visible() | Where-Object { $_.Title -ne "" })
   }
+  "minimize" {
+    Use-Native
+    Out-Json ([ordered]@{ minimized = [RlutWin]::Minimize($Name) })
+  }
   "procs" {
     Out-Json @(Get-Procs)
   }
@@ -225,6 +243,9 @@ switch ($Action) {
     }
     $item = Get-Item -LiteralPath $Target
     $vi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($item.FullName)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($item.FullName)
+    try { $hash = [System.BitConverter]::ToString($sha.ComputeHash($stream)) -replace '-', '' } finally { $stream.Dispose(); $sha.Dispose() }
     Out-Json ([ordered]@{
       path = $item.FullName
       exists = $true
@@ -234,7 +255,7 @@ switch ($Action) {
       fileVersion = $vi.FileVersion
       productName = $vi.ProductName
       fileDescription = $vi.FileDescription
-      sha256 = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash
+      sha256 = $hash
     })
   }
   "uia" {

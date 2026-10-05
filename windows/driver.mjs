@@ -114,13 +114,19 @@ function fail(message) {
 
 // --- probes ----------------------------------------------------------------------------------
 
+/**
+ * Windows PowerShell started from the step's PowerShell 7 inherits its PSModulePath and then cannot
+ * load its own modules (Get-CimInstance, Get-FileHash), so it gets the environment without it.
+ */
+const PS_ENV = Object.fromEntries(Object.entries(process.env).filter(([k]) => k.toLowerCase() !== "psmodulepath"))
+
 function ps(action, target = "", name = "") {
   const args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", P.win, "-Action", action]
   if (target) args.push("-Target", target)
   if (name) args.push("-Name", name)
-  const r = spawnSync("powershell.exe", args, { encoding: "utf8", timeout: 120_000, windowsHide: true })
+  const r = spawnSync("powershell.exe", args, { encoding: "utf8", timeout: 120_000, windowsHide: true, env: PS_ENV })
   if (r.status !== 0) throw new Error(`win.ps1 ${action} failed (${r.status ?? r.signal ?? r.error?.message}): ${(r.stderr || "").trim().slice(0, 1500)}`)
-  const out = (r.stdout || "").replace(/^﻿/, "").trim()
+  const out = (r.stdout || "").replace(/^\uFEFF/, "").trim()
   return out ? JSON.parse(out) : null
 }
 function tryPs(action, target = "", name = "") {
@@ -226,7 +232,7 @@ const DATA_KEYS = ["schemaVersion", "installations", "gameVersions", "defaultIns
 
 function readConfig() {
   try {
-    return JSON.parse(readFileSync(join(P.userData, "config.json"), "utf8").replace(/^﻿/, ""))
+    return JSON.parse(readFileSync(join(P.userData, "config.json"), "utf8").replace(/^\uFEFF/, ""))
   } catch (error) {
     return { unreadable: error.message }
   }
@@ -366,7 +372,12 @@ function element(selector) {
   )
 }
 
-async function safeClick(selector, expectedLabel) {
+/**
+ * Clicks one launcher control by selector, after checking its accessible name. `closesApp` is for
+ * Restart and update: the launcher may quit before the DevTools call answers, which is not a
+ * failure of the click.
+ */
+async function safeClick(selector, expectedLabel, { closesApp = false } = {}) {
   let info = element(selector)
   if (!info) throw new Error(`nothing matches ${selector}`)
   if (info.label !== expectedLabel || FORBIDDEN.test(info.label ?? "") || FORBIDDEN.test(info.text ?? "")) throw new Error(`refusing to click ${JSON.stringify(info)}`)
@@ -378,7 +389,15 @@ async function safeClick(selector, expectedLabel) {
     if (Math.abs(now.x - info.x) < 0.5 && Math.abs(now.y - info.y) < 0.5) break
     info = now
   }
-  const r = cdp("click", selector)
+  let r = cdp("click", selector)
+  if (!r.ok && /covered/.test(r.err) && !SAFE_DISMISS.includes(expectedLabel)) {
+    await dismissPrompts("covered")
+    r = cdp("click", selector)
+  }
+  if (!r.ok && closesApp) {
+    log(`clicked "${expectedLabel}"; the DevTools call did not answer (${r.err}), the launcher was closing`)
+    return
+  }
   if (!r.ok) throw new Error(`clicking ${expectedLabel} failed: ${r.err}`)
   log(`clicked "${expectedLabel}"`)
 }
@@ -408,6 +427,8 @@ async function waitOffer(label, since) {
   }
   log(`${label}: offer shown: "${offer.text.replace(/\s+/g, " ").trim()}"`, { buttons: offer.buttons })
   desktopShot(`${label}-offer`)
+  // A prompt can open after the launch settled; answer it before reaching for the toast.
+  await dismissPrompts(label)
   return offer
 }
 
@@ -449,14 +470,18 @@ function verifyPending() {
   return result
 }
 
+const watchers = new Set()
 function startWatcher(label) {
   const dir = join(EVIDENCE, `watch-${label}`)
   const stopFile = join(process.env.RUNNER_TEMP, `stop-watch-${label}`)
-  const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", P.win, "-Action", "watch", "-Target", dir, "-Name", stopFile], { stdio: "ignore", windowsHide: true })
-  return { dir, stopFile, child }
+  const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", P.win, "-Action", "watch", "-Target", dir, "-Name", stopFile], { stdio: "ignore", windowsHide: true, env: PS_ENV })
+  const watcher = { dir, stopFile, child }
+  watchers.add(watcher)
+  return watcher
 }
 
 async function stopWatcher(watcher) {
+  watchers.delete(watcher)
   writeFileSync(watcher.stopFile, "stop")
   const exited = await until(() => watcher.child.exitCode !== null, 20_000, 500)
   if (!exited) watcher.child.kill()
@@ -557,8 +582,8 @@ async function followInstaller(label, oldPids, startedAt, { waitForPlayer, deadl
       log(`${label}: a new launcher process runs from the install folder after ${at()} s: ${fresh.cmd}`)
       desktopShot(`${label}-new-launcher-up`)
     }
-    if (installer) {
-      const ui = tryPs("uia", String(installer.pid))
+    const ui = installer ? tryPs("uia", String(installer.pid)) : null
+    if (ui) {
       const signature = pageSignature(ui)
       if (signature !== lastSignature) {
         lastSignature = signature
@@ -649,7 +674,7 @@ async function restartScenario() {
   const watcher = startWatcher("restart")
   await sleep(2500)
   const clickedAt = Date.now()
-  await safeClick(toastButton(ready.id, "Restart and update"), "Restart and update")
+  await safeClick(toastButton(ready.id, "Restart and update"), "Restart and update", { closesApp: true })
   const follow = await followInstaller("restart", oldPids, clickedAt, { waitForPlayer: true, deadlineMs: 300_000 })
   report.restart = follow
   if (follow.newLauncher) {
@@ -745,6 +770,7 @@ async function closeAndFollow(label) {
   const list = procs()
   const oldPids = launcherProcs(list).map((p) => p.pid)
   const main = mainOf(list)
+  if (!main) throw new Error(`${label}: the launcher is not running any more, there is nothing to close`)
   const before = logSize()
   const watcher = startWatcher(label)
   await sleep(2500)
@@ -763,6 +789,9 @@ async function closeAndFollow(label) {
 // --- main ------------------------------------------------------------------------------------
 
 async function main() {
+  // The runner's own agent console covers most of its small screen; out of the way, the
+  // screenshots show what a player would see.
+  tryPs("minimize", "", "CASCADIA_HOSTING_WINDOW_CLASS")
   const probe = tryPs("windows")
   report.runner = { screen: tryPs("shot", join(EVIDENCE, "shots", "00-desktop-at-start.png"))?.screen ?? null, visibleWindows: probe?.map((w) => `${w.Process} | ${w.Class} | ${w.Title}`) ?? null }
   log(`runner desktop ${report.runner.screen}; visible windows: ${(report.runner.visibleWindows ?? []).join(" ; ")}`)
@@ -788,6 +817,7 @@ try {
   fail(error.stack ?? String(error))
   exitCode = 1
 } finally {
+  for (const watcher of [...watchers]) await stopWatcher(watcher)
   try {
     if (existsSync(join(P.userData, "Logs"))) cpSync(join(P.userData, "Logs"), join(EVIDENCE, "logs"), { recursive: true })
     report.updaterCacheAtEnd = listing(P.updaterCache)
