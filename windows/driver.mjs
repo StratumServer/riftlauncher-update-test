@@ -968,8 +968,10 @@ async function main() {
   try {
     const feed = await (await fetch("https://github.com/StratumServer/riftlauncher-update-test/releases.atom", { signal: AbortSignal.timeout(15_000) })).text()
     const latest = await fetch("https://github.com/StratumServer/riftlauncher-update-test/releases/latest", { redirect: "manual", signal: AbortSignal.timeout(15_000) })
-    report.feed = { order: [...feed.matchAll(/releases\/tag\/([^"]+)"/g)].map((m) => m[1]), latest: latest.headers.get("location") }
-    log(`releases feed order ${report.feed.order.join(", ")}; releases/latest -> ${report.feed.latest}`)
+    // The question electron-updater asks when prereleases are off (GitHubProvider.getLatestTagName).
+    const latestJson = await (await fetch("https://github.com/StratumServer/riftlauncher-update-test/releases/latest", { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(15_000) })).json()
+    report.feed = { order: [...feed.matchAll(/releases\/tag\/([^"]+)"/g)].map((m) => m[1]), latest: latest.headers.get("location"), latestTagAsJson: latestJson.tag_name }
+    log(`releases feed order ${report.feed.order.join(", ")}; releases/latest -> ${report.feed.latest}, as JSON ${report.feed.latestTagAsJson}`)
   } catch (error) {
     report.errors.push(`reading the releases feed: ${error.message}`)
   }
