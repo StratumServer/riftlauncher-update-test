@@ -1,26 +1,42 @@
 #!/usr/bin/env node
 /**
- * Runs one beta to stable update scenario of RiftLauncher on a fresh Windows runner, and leaves
- * its evidence in $EVIDENCE: report.json, timeline.log, desktop and page screenshots, the
- * launcher's logs, process lists, registry entries and profile snapshots.
+ * Runs one update scenario of RiftLauncher on a fresh Windows runner, and leaves its evidence in
+ * $EVIDENCE: report.json, timeline.log, desktop and page screenshots, the launcher's logs, process
+ * lists and trace, registry entries and profile snapshots.
  *
- *   node windows/driver.mjs <on|off|unset|defer>
+ *   OLD_VERSION=<old> NEW_VERSION=<new> node windows/driver.mjs <scenario>
  *
- * on, off, unset: receiveBetaUpdates true, false, or absent from config.json. Install
- * 1.7.0-beta.13 per user and silently, seed a profile, launch it with a DevTools port, accept the
- * 1.7.0 offer, wait for the download, press Restart and update, then follow the installer it starts
- * until 1.7.0 runs from the same folder.
+ * Every scenario installs the old build per user and silently (installers/old/dist), seeds a
+ * profile and starts the installed exe with a DevTools port. The update feed offers the new build,
+ * whose latest.yml is in installers/new/dist.
  *
- * defer: receiveBetaUpdates absent. First launch: Not now, close. Second launch: Update now, wait
- * for the download, close without Restart and update. Third launch: whatever is installed by then.
+ * The beta to stable runs (RiftLauncher issue 615), where Restart and update opened the installer's
+ * wizard and its pages were answered as a player would:
+ *   on, off, unset  receiveBetaUpdates true, false, or absent from config.json. Update now, wait for
+ *                   the download, Restart and update, then follow the installer until the new
+ *                   version runs from the same folder, pressing Next > and Finish once a page has
+ *                   waited a while.
+ *   defer           receiveBetaUpdates absent. First launch: Not now, close. Second launch: Update
+ *                   now, wait for the download, close without Restart and update. Third launch:
+ *                   whatever is installed by then.
  *
- * The launcher is driven with RiftLauncher's own scripts/headless/cdp.mjs, checked out at the
- * pinned dev commit beside this repository. Only the launcher's update controls are clicked, by
+ * The silent update (RiftLauncher issue 668), where nothing at all is clicked after Restart and
+ * update and the installer must neither show a window nor wait:
+ *   restart               receiveBetaUpdates absent. Update now, wait for the download, Restart
+ *                         and update, then watch the installer run and the launcher start again.
+ *   restart-on            the same with receiveBetaUpdates true.
+ *   close-after-download  receiveBetaUpdates absent. Update now, wait for the download, close the
+ *                         launcher and check that nothing was installed. Launch again, still the old
+ *                         version, take the update that comes back, then as restart.
+ *
+ * The launcher is driven with RiftLauncher's own scripts/headless/cdp.mjs, checked out at the new
+ * build's commit beside this repository. Only the launcher's update controls are clicked, by
  * selector: the action buttons of the update toasts, which carry aria-label = their text
- * (src/renderer/src/components/layout/NotificationsOverlay.tsx at v1.7.0-beta.13). No key is ever
- * sent, and anything named Play or Join is refused. In the installer window, only Next >, Install
- * and Finish are ever pressed, and only once the installer has been sitting on a page for a while,
- * which is what a player would have to do.
+ * (src/renderer/src/components/layout/NotificationsOverlay.tsx). No key is ever sent, anything
+ * named Play or Join is refused, and a prompt that opens is recorded, never answered. In the
+ * installer window, only Next >, Install and Finish are ever pressed, only in on, off and unset,
+ * and only once the installer has been sitting on a page for a while, which is what a player would
+ * have to do.
  */
 
 import { spawn, spawnSync } from "node:child_process"
@@ -29,24 +45,39 @@ import { appendFileSync, closeSync, cpSync, existsSync, mkdirSync, openSync, rea
 import { basename, join } from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 
-const SCENARIOS = { on: true, off: false, unset: undefined, defer: undefined }
+/**
+ * beta: receiveBetaUpdates in the seeded config.json, undefined for absent. silent: Restart and
+ * update must install without a window and start the launcher again, with nothing clicked after it.
+ */
+const SCENARIOS = {
+  on: { beta: true, flow: "restart", silent: false },
+  off: { beta: false, flow: "restart", silent: false },
+  unset: { beta: undefined, flow: "restart", silent: false },
+  defer: { beta: undefined, flow: "defer", silent: false },
+  restart: { beta: undefined, flow: "restart", silent: true },
+  "restart-on": { beta: true, flow: "restart", silent: true },
+  "close-after-download": { beta: undefined, flow: "close-after-download", silent: true }
+}
 const scenario = process.argv[2]
 if (!Object.hasOwn(SCENARIOS, scenario)) {
-  console.error("usage: node windows/driver.mjs <on|off|unset|defer>")
+  console.error(`usage: node windows/driver.mjs <${Object.keys(SCENARIOS).join("|")}>`)
   process.exit(2)
 }
+const SPEC = SCENARIOS[scenario]
 
 const WS = process.env.GITHUB_WORKSPACE
 const EVIDENCE = process.env.EVIDENCE
 const APPDATA = process.env.APPDATA
 const LOCALAPPDATA = process.env.LOCALAPPDATA
-if (!WS || !EVIDENCE || !APPDATA || !LOCALAPPDATA || process.platform !== "win32") {
-  console.error("Runs on a Windows runner only, with GITHUB_WORKSPACE, EVIDENCE, APPDATA and LOCALAPPDATA set.")
+const OLD_VERSION = process.env.OLD_VERSION
+const NEW_VERSION = process.env.NEW_VERSION
+if (!WS || !EVIDENCE || !APPDATA || !LOCALAPPDATA || !OLD_VERSION || !NEW_VERSION || process.platform !== "win32") {
+  console.error("Runs on a Windows runner only, with GITHUB_WORKSPACE, EVIDENCE, APPDATA, LOCALAPPDATA, OLD_VERSION and NEW_VERSION set.")
   process.exit(2)
 }
 
 const P = {
-  oldSetup: join(WS, "installers", "old", "dist", "riftlauncher-1.7.0-beta.13-setup.exe"),
+  oldSetup: join(WS, "installers", "old", "dist", `riftlauncher-${OLD_VERSION}-setup.exe`),
   newFeed: join(WS, "installers", "new", "dist", "latest.yml"),
   seed: join(WS, "rl-new", "scripts", "headless", "seed.mjs"),
   cdp: join(WS, "rl-new", "scripts", "headless", "cdp.mjs"),
@@ -57,8 +88,6 @@ const P = {
 const INFO_LOG = join(P.userData, "Logs", "info.log")
 /** One DevTools port per launch: the installer the launcher spawns inherits its listening socket and keeps the port while it runs. */
 let port = 9250
-const NEW_VERSION = "1.7.0"
-const OLD_VERSION = "1.7.0-beta.13"
 
 /** One made-up installation with two made-up Mods and an empty version folder. No game, no account. */
 const SEED_SPEC = {
@@ -73,8 +102,8 @@ const OFFER_TEXT = "is available. Do you want to download it now?"
 const READY_TEXT = "The update is ready to install."
 const RETRY_TEXT = "failed. Do you want to try again?"
 const FORBIDDEN = /\b(play|join)\b/i
-/** Buttons of the prompts a fresh launch can open, safe to answer: none of them starts anything. */
-const SAFE_DISMISS = ["No thanks", "Not this time", "Got it"]
+/** Buttons of the prompts a fresh launch can open. They are recorded when they show, never pressed. */
+const PROMPT_BUTTONS = ["No thanks", "Not this time", "Got it"]
 const INSTALLER_BUTTONS = ["Finish", "Install", "Next >"]
 /** How long the installer may sit on one page before the player's click is made for it. */
 const PLAYER_PAUSE_MS = 20_000
@@ -86,7 +115,9 @@ mkdirSync(join(EVIDENCE, "snapshots"), { recursive: true })
 const t0 = Date.now()
 const report = {
   scenario,
-  receiveBetaUpdates: SCENARIOS[scenario] === undefined ? "(absent)" : SCENARIOS[scenario],
+  receiveBetaUpdates: SPEC.beta === undefined ? "(absent)" : SPEC.beta,
+  oldVersion: OLD_VERSION,
+  newVersion: NEW_VERSION,
   startedAt: new Date().toISOString(),
   verdict: {},
   errors: [],
@@ -336,8 +367,8 @@ function seedProfile() {
   }
   const file = join(P.userData, "config.json")
   const config = rebase(JSON.parse(readFileSync(file, "utf8")), from, APPDATA)
-  if (SCENARIOS[scenario] === undefined) delete config.receiveBetaUpdates
-  else config.receiveBetaUpdates = SCENARIOS[scenario]
+  if (SPEC.beta === undefined) delete config.receiveBetaUpdates
+  else config.receiveBetaUpdates = SPEC.beta
   writeFileSync(file, JSON.stringify(config, null, 2))
   log(`seeded the profile under %APPDATA%: receiveBetaUpdates ${report.receiveBetaUpdates}`, { config })
 }
@@ -393,12 +424,10 @@ async function safeClick(selector, expectedLabel, { closesApp = false } = {}) {
     if (Math.abs(now.x - info.x) < 0.5 && Math.abs(now.y - info.y) < 0.5) break
     info = now
   }
-  let r = cdp("click", selector)
-  if (!r.ok && /covered/.test(r.err) && !SAFE_DISMISS.includes(expectedLabel)) {
-    await dismissPrompts("covered")
-    r = cdp("click", selector)
-  }
-  if (!r.ok && closesApp) {
+  const r = cdp("click", selector)
+  const covered = !r.ok && /covered/.test(r.err)
+  if (covered) notePrompts("covered")
+  if (!r.ok && closesApp && !covered) {
     log(`clicked "${expectedLabel}"; the DevTools call did not answer (${r.err}), the launcher was closing`)
     return
   }
@@ -413,13 +442,13 @@ function findToast(part) {
 }
 const toastButton = (id, label) => `[data-toast-id="${id}"] button[aria-label="${label}"]`
 
-async function dismissPrompts(label) {
-  for (const name of SAFE_DISMISS) {
+/** Records any prompt the launcher has open, with a screenshot. Nothing in it is pressed. */
+function notePrompts(label) {
+  for (const name of PROMPT_BUTTONS) {
     const selector = `button[aria-label="${name}"]`
     if (cdpEval(`!!document.querySelector(${JSON.stringify(selector)})`) !== true) continue
+    log(`${label}: a prompt is open, with "${name}"; left unanswered`, { visibleText: pageText().slice(0, 1500) })
     desktopShot(`${label}-prompt-${name.replace(/\W+/g, "-").toLowerCase()}`)
-    await safeClick(selector, name)
-    await sleep(1000)
   }
 }
 
@@ -431,8 +460,7 @@ async function waitOffer(label, since) {
   }
   log(`${label}: offer shown: "${offer.text.replace(/\s+/g, " ").trim()}"`, { buttons: offer.buttons })
   desktopShot(`${label}-offer`)
-  // A prompt can open after the launch settled; answer it before reaching for the toast.
-  await dismissPrompts(label)
+  notePrompts(label)
   return offer
 }
 
@@ -496,7 +524,10 @@ async function traceBetween(label, fromMs, toMs) {
   } catch (error) {
     report.errors.push(`reading the process trace: ${error.message}`)
   }
-  for (const e of entries) log(`${label}: trace ${e.t.slice(11, 23)} ${e.kind} ${e.name} pid ${e.pid} parent ${e.ppid}${e.kind === "stop" ? ` exit ${e.exitStatus}` : ""}${e.cmd ? `: ${e.cmd.slice(0, 260)}` : ""}`)
+  for (const e of entries) {
+    e.afterS = Number(((Date.parse(e.t) - fromMs) / 1000).toFixed(1))
+    log(`${label}: trace ${e.t.slice(11, 23)} (${e.afterS >= 0 ? "+" : ""}${e.afterS} s) ${e.kind} ${e.name} pid ${e.pid} parent ${e.ppid}${e.parentName ? ` (${e.parentName})` : ""}${e.kind === "stop" ? ` exit ${e.exitStatus}` : ""}${e.cmd ? `: ${e.cmd.slice(0, 260)}` : ""}`)
+  }
   return entries
 }
 
@@ -599,7 +630,8 @@ async function followInstaller(label, oldPids, startedAt, { waitForPlayer, deadl
       seen.installerExitAfterS = at()
       log(`${label}: installer exited after ${at()} s`)
     }
-    for (const u of list.filter((p) => /^un_[a-z]\.exe$/i.test(p.name) || /^uninstall riftlauncher/i.test(p.name))) {
+    // Un_A.exe, old-uninstaller.exe (the installer's copy of the old version's uninstaller), or the installed one.
+    for (const u of list.filter((p) => /^un_[a-z]\.exe$|uninstall/i.test(p.name))) {
       if (!seen.uninstallers.some((x) => x.pid === u.pid)) {
         seen.uninstallers.push({ ...u, seenAfterS: at() })
         log(`${label}: old version's uninstaller running after ${at()} s: ${u.cmd}`)
@@ -663,8 +695,10 @@ function installState(label) {
   const shortcuts = shortcutState()
   writeJson(`shortcuts-${label}.json`, shortcuts)
   const displayVersion = reg?.hkcuUninstall?.[0]?.values?.DisplayVersion ?? null
-  log(`${label}: exe ProductVersion ${exe?.productVersion}, FileVersion ${exe?.fileVersion}, HKCU DisplayVersion ${displayVersion}, HKLM entries ${reg?.hklmUninstall?.length ?? "?"}`)
-  return { reg, exe, displayVersion, shortcuts }
+  // Where a per-machine install would go.
+  const programFiles = [process.env.ProgramFiles, process.env["ProgramFiles(x86)"]].filter(Boolean).map((d) => join(d, "RiftLauncher")).filter((d) => existsSync(d))
+  log(`${label}: exe ProductVersion ${exe?.productVersion}, FileVersion ${exe?.fileVersion}, HKCU DisplayVersion ${displayVersion} (${reg?.hkcuUninstall?.length ?? "?"} HKCU entries), HKLM entries ${reg?.hklmUninstall?.length ?? "?"}, Program Files copies ${programFiles.length}`)
+  return { reg, exe, displayVersion, shortcuts, programFiles }
 }
 /** The per-user shortcuts the installer made, which an update is meant to keep. */
 function shortcutState() {
@@ -678,7 +712,7 @@ function shortcutState() {
     }
   }))
 }
-/** The exe's FileVersion and the uninstall entry's DisplayVersion both say `v`. Its ProductVersion is 1.7.0.0 for the beta and the stable alike. */
+/** The exe's FileVersion and the uninstall entry's DisplayVersion both say `v`. Its ProductVersion drops any prerelease part (1.7.0.0 for 1.7.0-beta.13 and 1.7.0 alike). */
 const isVersion = (s, v) => Boolean(s?.exe?.exists) && s.displayVersion === v && s.exe.fileVersion === v
 
 // --- scenarios -------------------------------------------------------------------------------
@@ -708,7 +742,7 @@ async function restartScenario() {
   const s0 = snapshot("0-seeded")
   const first = await launch("old")
   report.oldVersionOverCdp = first.version
-  await dismissPrompts("old")
+  notePrompts("old")
   const offer = await waitOffer("old", since)
   v.offered = Boolean(offer)
   if (!offer) return
@@ -719,33 +753,61 @@ async function restartScenario() {
   report.download.pending = pending
   v.downloadedVerified = pending.match
   const s1 = snapshot("1-before-restart")
+  await restartAndUpdate(ready)
+  await afterUpdate(s0, s1, 2)
+}
 
+/**
+ * Presses Restart and update on the ready toast and follows the handover until the launcher runs
+ * again from the install folder. In the silent scenarios nothing is pressed after that one click,
+ * and the screen is captured every couple of seconds from just before it until the new launcher
+ * is up (watch-restart/).
+ */
+async function restartAndUpdate(ready) {
+  const v = report.verdict
   const oldPids = launcherProcs(procs()).map((p) => p.pid)
   const before = logSize()
   const watcher = startWatcher("restart")
   await sleep(2500)
   const clickedAt = Date.now()
   await safeClick(toastButton(ready.id, "Restart and update"), "Restart and update", { closesApp: true })
-  const follow = await followInstaller("restart", oldPids, clickedAt, { waitForPlayer: true, deadlineMs: 300_000 })
+  const follow = await followInstaller("restart", oldPids, clickedAt, { waitForPlayer: !SPEC.silent, deadlineMs: 300_000 })
   report.restart = follow
   follow.processTrace = await traceBetween("restart", clickedAt, Date.now())
   if (follow.newLauncher) {
-    const versionLine = await waitVersionLine(before)
-    report.restart.versionLogLine = versionLine
-    log(`after the restart, the updater logged: ${versionLine ?? "(nothing within 90 s)"}`)
+    follow.versionLogLine = await waitVersionLine(before)
+    log(`after the restart, the updater logged: ${follow.versionLogLine ?? "(nothing within 90 s)"}`)
     await sleep(2000)
     desktopShot("after-restart")
-    report.restart.processes = procs()
-    writeJson("procs-after-restart.json", report.restart.processes)
+    follow.processes = procs()
+    writeJson("procs-after-restart.json", follow.processes)
   }
-  report.restart.windowsSeen = await stopWatcher(watcher)
-  report.restart.logAfterClick = updaterLines(logSince(before))
+  follow.windowsSeen = await stopWatcher(watcher)
+  follow.logAfterClick = updaterLines(logSince(before))
   const after = installState("after-restart")
   v.installed = isVersion(after, NEW_VERSION)
-  v.restartedOn170 = Boolean(follow.newLauncher) && /version 1\.7\.0 is not available/.test(report.restart.versionLogLine ?? "")
+  v.restartedOnNew = Boolean(follow.newLauncher) && (follow.versionLogLine ?? "").includes(`version ${NEW_VERSION} is not available`)
+  if (!SPEC.silent) return
 
+  const executing = follow.logAfterClick.find((l) => /Executing: .* with args: /.test(l)) ?? null
+  const traced = follow.processTrace.find((e) => e.kind === "start" && /\\riftlauncher-updater\\pending\\/i.test(e.cmd ?? ""))
+  const installerCmd = follow.installer?.cmd ?? traced?.cmd ?? null
+  // Windows that showed up during the handover from anything but the new launcher or the shell.
+  const strangers = follow.windowsSeen.filter((w) => !/^(RiftLauncher|explorer) \(pid/.test(w))
+  const otherCopies = (follow.processes ?? []).filter((p) => /^riftlauncher\.exe$/i.test(p.name) && !samePath(p.path, state.exe))
+  v.installerSilent = /with args: --updated,\/S,--force-run\s*$/.test(executing ?? "") && / --updated \/S --force-run\s*$/.test(installerCmd ?? "")
+  v.noInstallerWindow = follow.pages.length === 0 && strangers.length === 0
+  v.restartedWithoutClick = Boolean(follow.newLauncher) && follow.presses.length === 0
+  v.noPerMachineInstall = after.reg?.hkcuUninstall?.length === 1 && after.reg?.hklmUninstall?.length === 0 && after.programFiles.length === 0 && otherCopies.length === 0
+  follow.silentCheck = { executing, installerCmd, strangers, otherCopies, programFiles: after.programFiles }
+  log(`restart: installer ${installerCmd ?? "(not seen)"}; installer windows ${follow.pages.length}; other windows ${strangers.join(" ; ") || "none"}; presses ${follow.presses.length}; old gone after ${follow.oldGoneAfterS} s, installer exited after ${follow.installerExitAfterS} s, new launcher after ${follow.newLauncher?.seenAfterS ?? "-"} s`)
+}
+
+/** Closes the restarted launcher, checks the profile, then starts the installed exe once more. */
+async function afterUpdate(s0, s1, n) {
+  const v = report.verdict
   await closeLauncher("restarted")
-  const s2 = snapshot("2-after-update")
+  const s2 = snapshot(`${n}-after-update`)
   report.data = { seededVsAfter: compare(s0, s2), beforeRestartVsAfter: compare(s1, s2) }
   // The update must not touch anything the launcher held just before it, and the seeded
   // installation, Mods and version folder must all still be there.
@@ -757,8 +819,62 @@ async function restartScenario() {
   report.relaunch.visibleText = pageText().slice(0, 2500)
   desktopShot("new-relaunch-settled")
   await closeLauncher("new-relaunch")
-  report.data.afterRelaunch = compare(s2, snapshot("3-after-relaunch"))
+  report.data.afterRelaunch = compare(s2, snapshot(`${n + 1}-after-relaunch`))
   v.relaunchVersion = relaunch.version
+}
+
+async function closeAfterDownloadScenario() {
+  const v = report.verdict
+  let since = logSize()
+  const s0 = snapshot("0-seeded")
+  const first = await launch("old-1")
+  report.oldVersionOverCdp = first.version
+  notePrompts("old-1")
+  const offer = await waitOffer("old-1", since)
+  v.offered = Boolean(offer)
+  if (!offer) return
+  const ready1 = await acceptAndDownload("old-1", offer, since)
+  report.download = { updaterLog: updaterLines(logSince(since)) }
+  if (!ready1) return
+  report.download.pending = verifyPending()
+  v.downloadedVerified = report.download.pending.match
+  snapshot("1-before-quit")
+
+  // Closed with the update downloaded and Restart and update left alone: nothing may install.
+  const quit = await closeAndFollow("old-1")
+  report.quit = quit
+  const afterQuit = installState("after-quit")
+  quit.installLines = quit.logAfterClose.filter((l) => /Auto install update on quit|Install: isSilent|Executing: /.test(l))
+  quit.pendingAfter = listing(join(P.updaterCache, "pending"))
+  v.nothingInstalledOnQuit = !quit.installer && !quit.newLauncher && quit.uninstallers.length === 0 && quit.installLines.length === 0 && isVersion(afterQuit, OLD_VERSION)
+  snapshot("2-after-quit")
+
+  since = logSize()
+  const second = await launch("old-2")
+  report.secondLaunch = { versionOverCdp: second.version }
+  v.nextLaunchStillOld = second.version === OLD_VERSION
+  notePrompts("old-2")
+  const back = await until(() => {
+    const ready = findToast(READY_TEXT)
+    if (ready) return { kind: "ready", toast: ready }
+    const offered = findToast(OFFER_TEXT)
+    return offered ? { kind: "offer", toast: offered } : null
+  }, 120_000)
+  v.offerCameBack = Boolean(back)
+  if (!back) {
+    log("old-2: neither the offer nor the ready toast within 120 s", { updaterLog: updaterLines(logSince(since)) })
+    return
+  }
+  log(`old-2: the ${back.kind === "ready" ? "ready toast" : "offer"} came back: "${back.toast.text.replace(/\s+/g, " ").trim()}"`, { buttons: back.toast.buttons })
+  desktopShot(`old-2-${back.kind}`)
+  const ready2 = back.kind === "ready" ? back.toast : await acceptAndDownload("old-2", back.toast, since)
+  report.secondDownload = { cameBackAs: back.kind, updaterLog: updaterLines(logSince(since)) }
+  if (!ready2) return
+  report.secondDownload.pending = verifyPending()
+  v.secondDownloadVerified = report.secondDownload.pending.match
+  const s1 = snapshot("3-before-restart")
+  await restartAndUpdate(ready2)
+  await afterUpdate(s0, s1, 4)
 }
 
 async function deferScenario() {
@@ -767,7 +883,7 @@ async function deferScenario() {
   const s0 = snapshot("0-seeded")
   const first = await launch("old-1")
   report.oldVersionOverCdp = first.version
-  await dismissPrompts("old-1")
+  notePrompts("old-1")
   const offer1 = await waitOffer("old-1", since)
   v.offeredFirst = Boolean(offer1)
   if (!offer1) return
@@ -784,7 +900,7 @@ async function deferScenario() {
   since = logSize()
   const second = await launch("old-2")
   report.secondLaunchVersion = second.version
-  await dismissPrompts("old-2")
+  notePrompts("old-2")
   const offer2 = await waitOffer("old-2", since)
   v.offeredAgain = Boolean(offer2)
   if (!offer2) return
@@ -860,7 +976,8 @@ async function main() {
   startTrace()
   await installOld()
   seedProfile()
-  if (scenario === "defer") await deferScenario()
+  if (SPEC.flow === "defer") await deferScenario()
+  else if (SPEC.flow === "close-after-download") await closeAfterDownloadScenario()
   else await restartScenario()
 }
 
@@ -882,15 +999,27 @@ try {
     report.errors.push(`collecting evidence: ${error.message}`)
   }
   const v = report.verdict
-  const expected = scenario === "defer" ? ["offeredFirst", "offeredAgain", "downloadedVerified", "dataIntact"] : ["offered", "downloadedVerified", "installed", "restartedOn170", "dataIntact"]
+  const expected =
+    SPEC.flow === "defer"
+      ? ["offeredFirst", "offeredAgain", "downloadedVerified", "dataIntact"]
+      : [
+          "offered",
+          "downloadedVerified",
+          ...(SPEC.flow === "close-after-download" ? ["nothingInstalledOnQuit", "nextLaunchStillOld", "offerCameBack", "secondDownloadVerified"] : []),
+          "installed",
+          "restartedOnNew",
+          ...(SPEC.silent ? ["installerSilent", "noInstallerWindow", "restartedWithoutClick", "noPerMachineInstall"] : []),
+          "dataIntact"
+        ]
   const missing = expected.filter((k) => v[k] !== true)
-  if (scenario === "defer" && v.thirdLaunchVersion !== NEW_VERSION) missing.push("thirdLaunchVersion")
+  if (SPEC.flow === "defer" && v.thirdLaunchVersion !== NEW_VERSION) missing.push("thirdLaunchVersion")
+  if (SPEC.flow !== "defer" && v.relaunchVersion !== NEW_VERSION) missing.push("relaunchVersion")
   if (missing.length) exitCode = 1
   report.finishedAt = new Date().toISOString()
   report.notAsExpected = missing
   save()
   const rows = Object.entries(v).map(([k, val]) => `| ${k} | ${JSON.stringify(val)} |`)
-  const summary = [`### Scenario ${scenario} (receiveBetaUpdates ${report.receiveBetaUpdates})`, "", "| check | result |", "| --- | --- |", ...rows, "", report.errors.length ? `Errors: ${report.errors.length}, see report.json` : "No harness errors.", ""].join("\n")
+  const summary = [`### Scenario ${scenario}, ${OLD_VERSION} to ${NEW_VERSION} (receiveBetaUpdates ${report.receiveBetaUpdates})`, "", "| check | result |", "| --- | --- |", ...rows, "", report.errors.length ? `Errors: ${report.errors.length}, see report.json` : "No harness errors.", ""].join("\n")
   if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary + "\n")
   console.log(summary)
   process.exit(exitCode)

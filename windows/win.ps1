@@ -209,12 +209,13 @@ function Save-Shot([string]$Path) {
 }
 
 # The launcher (installed exe and its helpers), the downloaded installer, the old version's
-# uninstaller (NSIS runs it as Un_A.exe from a temp folder), and the PowerShell one-liners the
-# installer's running-app check spawns (they are the only ones calling Path.StartsWith).
+# uninstaller (the installer runs a copy of it as old-uninstaller.exe, which NSIS may restart as
+# Un_A.exe from a temp folder), and the PowerShell one-liners the installer's running-app check
+# spawns (they are the only ones calling Path.StartsWith).
 function Get-Procs {
   $all = Get-CimInstance Win32_Process
   foreach ($p in $all) {
-    $hit = ($p.Name -match '(?i)riftlauncher|^un_[a-z]\.exe$') -or
+    $hit = ($p.Name -match '(?i)riftlauncher|uninstall|^un_[a-z]\.exe$') -or
       ($p.ExecutablePath -match '(?i)\\riftlauncher-updater\\|\\Programs\\RiftLauncher\\') -or
       ($p.Name -eq 'powershell.exe' -and $p.CommandLine -and $p.CommandLine.Contains('StartsWith('))
     if (-not $hit) { continue }
@@ -324,7 +325,8 @@ switch ($Action) {
     # check's exit code is its answer (0: the launcher was still running).
     $outFile = $Target
     $stopFile = $Name
-    $interesting = '(?i)riftlauncher|^un_[a-z]\.exe$|^powershell\.exe$|^cmd\.exe$|^taskkill\.exe$|^tasklist\.exe$|^findstr\.exe$|^elevate\.exe$'
+    # consent.exe is the UAC prompt, which an install needing elevation would bring up.
+    $interesting = '(?i)riftlauncher|uninstall|^un_[a-z]\.exe$|^powershell\.exe$|^cmd\.exe$|^taskkill\.exe$|^tasklist\.exe$|^findstr\.exe$|^elevate\.exe$|^consent\.exe$'
     Register-CimIndicationEvent -ClassName Win32_ProcessStartTrace -SourceIdentifier RlutStart
     Register-CimIndicationEvent -ClassName Win32_ProcessStopTrace -SourceIdentifier RlutStop
     $tracked = @{}
@@ -338,10 +340,12 @@ switch ($Action) {
         $processId = [int]$e.ProcessID
         $isStart = $ev.SourceIdentifier -eq 'RlutStart'
         $cmd = $null
+        $parentName = $null
         if ($isStart) {
           if ([string]$e.ProcessName -notmatch $interesting) { continue }
           if ($Ignore -and [int]$e.ParentProcessID -eq $Ignore -and [string]$e.ProcessName -eq 'powershell.exe') { continue }
           $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$processId" -ErrorAction SilentlyContinue).CommandLine
+          $parentName = (Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$e.ParentProcessID)" -ErrorAction SilentlyContinue).Name
           # The driver's own probes are PowerShell too; they are not part of the update.
           if ($cmd -and $cmd.Contains('\harness\windows\win.ps1')) { continue }
           $tracked[$processId] = $true
@@ -354,6 +358,7 @@ switch ($Action) {
           name = [string]$e.ProcessName
           pid = $processId
           ppid = [int]$e.ParentProcessID
+          parentName = $parentName
           exitStatus = if ($isStart) { $null } else { [int64]$e.ExitStatus }
           cmd = $cmd
         })
@@ -374,20 +379,15 @@ switch ($Action) {
     $logFile = Join-Path $outDir "watch.jsonl"
     $deadline = (Get-Date).AddMinutes(10)
     $n = 0
-    $last = ""
     while ((Get-Date) -lt $deadline -and -not (Test-Path -LiteralPath $stopFile)) {
       try {
         $now = (Get-Date).ToUniversalTime().ToString("o")
         $wins = @([RlutWin]::Visible() | Where-Object { $_.Title -ne "" } | ForEach-Object { "{0}|{1}|{2}|{3}|{4},{5},{6}x{7}" -f $_.Pid, $_.Process, $_.Class, $_.Title, $_.Left, $_.Top, $_.Width, $_.Height })
         $procs = @(Get-Procs | ForEach-Object { "{0}<{1}|{2}|{3}" -f $_.pid, $_.ppid, $_.name, $_.cmd })
-        $signature = ($wins + $procs) -join "`n"
-        $shot = $null
-        if ($signature -ne $last -or ($n % 5) -eq 0) {
-          $shot = "{0:D3}.png" -f $n
-          try { [void](Save-Shot (Join-Path $outDir $shot)) } catch { $shot = "failed: $($_.Exception.Message)" }
-        }
+        # A screenshot on every tick, so what was on screen at any moment of a handover is on file.
+        $shot = "{0:D3}.png" -f $n
+        try { [void](Save-Shot (Join-Path $outDir $shot)) } catch { $shot = "failed: $($_.Exception.Message)" }
         [System.IO.File]::AppendAllText($logFile, (Out-Json ([ordered]@{ t = $now; shot = $shot; windows = $wins; procs = $procs })) + "`n")
-        $last = $signature
       } catch {
         [System.IO.File]::AppendAllText($logFile, (Out-Json ([ordered]@{ t = (Get-Date).ToUniversalTime().ToString("o"); error = $_.Exception.Message })) + "`n")
       }

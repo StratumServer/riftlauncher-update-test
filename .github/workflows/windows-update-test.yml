@@ -1,21 +1,44 @@
 name: Windows update test
 
-# The Windows half of RiftLauncher issue #615: the update from a 1.7.0 beta to the first stable
-# release, run for real on GitHub-hosted Windows runners against the two test releases of this
-# scratch repository. Manual only.
+# A RiftLauncher self-update, run for real on GitHub-hosted Windows runners against the releases of
+# this scratch repository. Manual only.
 #
-# build: the NSIS x64 installers of RiftLauncher v1.7.0-beta.13 (the tagged commit, at its own
-# version) and of dev at a pinned commit packaged as 1.7.0, both with their update feed pointed at
-# this repository. Each build's app-update.yml is checked before anything is uploaded, only the
-# Windows files go to the matching release, and the installers are kept as artifacts.
+# build: the NSIS x64 installers of two RiftLauncher commits, each packaged at the version given,
+# both with their update feed pointed at this repository. Each build's app-update.yml is checked
+# before anything is uploaded. Only the new build's Windows files go to a release (release_tag);
+# both installers are kept as an artifact, and the old one is installed from there.
 #
-# test: one fresh runner per scenario, receiveBetaUpdates on, off and unset, and an update put off
-# then left waiting when the launcher closes. See windows/driver.mjs.
+# test: one fresh runner per scenario. See windows/driver.mjs.
+#
+# The defaults are the beta to stable runs of RiftLauncher issue 615: v1.7.0-beta.13 to dev
+# packaged as 1.7.0. The silent Restart and update of issue 668 ran with old_sha and new_sha both
+# f8e0d1ba4369780dcba148b4475ac137768a4aee, old_version 1.7.0, new_version 1.7.1, release_tag v1.7.1
+# and the scenarios restart, restart-on and close-after-download.
 on:
   workflow_dispatch:
     inputs:
+      old_sha:
+        description: RiftLauncher commit of the build installed first (full SHA)
+        type: string
+        default: 1549cdbb552194082b1ad4045d743e04980ae132
+      old_version:
+        description: Version the old build is packaged as
+        type: string
+        default: 1.7.0-beta.13
+      new_sha:
+        description: RiftLauncher commit of the build the update brings (full SHA)
+        type: string
+        default: 9013f93c40d65436b0a4d49dea510f0c89329c99
+      new_version:
+        description: Version the new build is packaged as
+        type: string
+        default: 1.7.0
+      release_tag:
+        description: Release of this repository that gets the new build's Windows files (v<new_version>)
+        type: string
+        default: v1.7.0
       skip_build:
-        description: Reuse the Windows files already on the two releases instead of building them again
+        description: Reuse the Windows files already on the releases v<old_version> and release_tag instead of building them again
         type: boolean
         default: false
       scenarios:
@@ -30,6 +53,14 @@ concurrency:
   group: windows-update-test
   cancel-in-progress: false
 
+env:
+  REPO: StratumServer/riftlauncher-update-test
+  OLD_SHA: ${{ inputs.old_sha }}
+  OLD_VERSION: ${{ inputs.old_version }}
+  NEW_SHA: ${{ inputs.new_sha }}
+  NEW_VERSION: ${{ inputs.new_version }}
+  RELEASE_TAG: ${{ inputs.release_tag }}
+
 jobs:
   build:
     if: ${{ !inputs.skip_build }}
@@ -41,18 +72,27 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: Check out RiftLauncher v1.7.0-beta.13 (read only)
+      - name: Check the inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$OLD_SHA" =~ ^[0-9a-f]{40}$ && "$NEW_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::old_sha and new_sha must be full commit SHAs"; exit 1; }
+          semver='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+          [[ "$OLD_VERSION" =~ $semver && "$NEW_VERSION" =~ $semver ]] || { echo "::error::old_version and new_version must be versions like 1.7.1"; exit 1; }
+          [[ "$RELEASE_TAG" == "v$NEW_VERSION" ]] || { echo "::error::release_tag must be v$NEW_VERSION"; exit 1; }
+          gh release view "$RELEASE_TAG" --repo "$REPO" --json name,isPrerelease --jq '"\(.name) prerelease=\(.isPrerelease)"'
+      - name: Check out the old build's commit (read only)
         uses: actions/checkout@v4
         with:
           repository: StratumServer/RiftLauncher
-          ref: 1549cdbb552194082b1ad4045d743e04980ae132
+          ref: ${{ inputs.old_sha }}
           path: old
           persist-credentials: false
-      - name: Check out RiftLauncher dev (read only)
+      - name: Check out the new build's commit (read only)
         uses: actions/checkout@v4
         with:
           repository: StratumServer/RiftLauncher
-          ref: 9013f93c40d65436b0a4d49dea510f0c89329c99
+          ref: ${{ inputs.new_sha }}
           path: new
           persist-credentials: false
       - uses: actions/setup-node@v4
@@ -62,21 +102,24 @@ jobs:
           cache-dependency-path: |
             old/package-lock.json
             new/package-lock.json
-      - name: Build the 1.7.0-beta.13 installer
+      - name: Build the old installer
         working-directory: old
         run: |
-          npm ci
-          npm run build
-          npx electron-builder --win nsis --x64 --publish never \
-            -c.publish.provider=github -c.publish.owner=StratumServer -c.publish.repo=riftlauncher-update-test
-      - name: Build the 1.7.0 installer
-        working-directory: new
-        run: |
+          test "$(git rev-parse HEAD)" = "$OLD_SHA"
           npm ci
           npm run build
           npx electron-builder --win nsis --x64 --publish never \
             -c.publish.provider=github -c.publish.owner=StratumServer -c.publish.repo=riftlauncher-update-test \
-            -c.extraMetadata.version=1.7.0
+            "-c.extraMetadata.version=$OLD_VERSION"
+      - name: Build the new installer
+        working-directory: new
+        run: |
+          test "$(git rev-parse HEAD)" = "$NEW_SHA"
+          npm ci
+          npm run build
+          npx electron-builder --win nsis --x64 --publish never \
+            -c.publish.provider=github -c.publish.owner=StratumServer -c.publish.repo=riftlauncher-update-test \
+            "-c.extraMetadata.version=$NEW_VERSION"
       - name: Check that both update feeds point at this repository
         run: |
           check() {
@@ -84,36 +127,32 @@ jobs:
             local feed="$dir/dist/win-unpacked/resources/app-update.yml"
             echo "== $feed"; cat "$feed"
             grep -qx 'provider: github' "$feed" && grep -qx 'owner: StratumServer' "$feed" && grep -qx 'repo: riftlauncher-update-test' "$feed" \
-              || { echo "::error::$feed does not name StratumServer/riftlauncher-update-test"; exit 1; }
+              || { echo "::error::$feed does not name $REPO"; exit 1; }
             echo "== $dir/dist/latest.yml"; cat "$dir/dist/latest.yml"
             grep -qx "version: $version" "$dir/dist/latest.yml" || { echo "::error::$dir/dist/latest.yml is not $version"; exit 1; }
             ls -l "$dir/dist/riftlauncher-$version-setup.exe" "$dir/dist/riftlauncher-$version-setup.exe.blockmap"
+            sha256sum "$dir/dist/riftlauncher-$version-setup.exe"
           }
-          check old 1.7.0-beta.13
-          check new 1.7.0
+          check old "$OLD_VERSION"
+          check new "$NEW_VERSION"
           for d in old new; do
-            node -p "'$d: electron ' + require('./$d/node_modules/electron/package.json').version + ', electron-builder ' + require('./$d/node_modules/electron-builder/package.json').version + ', electron-updater ' + require('./$d/node_modules/electron-updater/package.json').version"
+            node -p "'$d: ' + require('./$d/package.json').version + ' in package.json, electron ' + require('./$d/node_modules/electron/package.json').version + ', electron-builder ' + require('./$d/node_modules/electron-builder/package.json').version + ', electron-updater ' + require('./$d/node_modules/electron-updater/package.json').version"
           done
-      - name: Upload the Windows files to the two test releases
+      - name: Upload the new build's Windows files to the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          repo=StratumServer/riftlauncher-update-test
-          gh release upload v1.7.0-beta.13 --repo "$repo" --clobber \
-            old/dist/riftlauncher-1.7.0-beta.13-setup.exe old/dist/riftlauncher-1.7.0-beta.13-setup.exe.blockmap old/dist/latest.yml
-          gh release upload v1.7.0 --repo "$repo" --clobber \
-            new/dist/riftlauncher-1.7.0-setup.exe new/dist/riftlauncher-1.7.0-setup.exe.blockmap new/dist/latest.yml
-          for tag in v1.7.0-beta.13 v1.7.0; do
-            gh release view "$tag" --repo "$repo" --json name,isPrerelease,assets --jq '"\(.name) prerelease=\(.isPrerelease)", (.assets[] | "  \(.name) \(.size)")'
-          done
+          gh release upload "$RELEASE_TAG" --repo "$REPO" --clobber \
+            "new/dist/riftlauncher-$NEW_VERSION-setup.exe" "new/dist/riftlauncher-$NEW_VERSION-setup.exe.blockmap" new/dist/latest.yml
+          gh release view "$RELEASE_TAG" --repo "$REPO" --json name,isPrerelease,assets --jq '"\(.name) prerelease=\(.isPrerelease)", (.assets[] | "  \(.name) \(.size)")'
       - uses: actions/upload-artifact@v4
         with:
           name: installers
           path: |
-            old/dist/riftlauncher-1.7.0-beta.13-setup.exe
+            old/dist/riftlauncher-${{ inputs.old_version }}-setup.exe
             old/dist/latest.yml
             old/dist/win-unpacked/resources/app-update.yml
-            new/dist/riftlauncher-1.7.0-setup.exe
+            new/dist/riftlauncher-${{ inputs.new_version }}-setup.exe
             new/dist/latest.yml
             new/dist/win-unpacked/resources/app-update.yml
           if-no-files-found: error
@@ -133,11 +172,11 @@ jobs:
         with:
           path: harness
           persist-credentials: false
-      - name: Check out RiftLauncher dev's headless scripts (read only)
+      - name: Check out the new build's headless scripts (read only)
         uses: actions/checkout@v4
         with:
           repository: StratumServer/RiftLauncher
-          ref: 9013f93c40d65436b0a4d49dea510f0c89329c99
+          ref: ${{ inputs.new_sha }}
           path: rl-new
           sparse-checkout: scripts/headless
           persist-credentials: false
@@ -156,14 +195,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          repo=StratumServer/riftlauncher-update-test
-          gh release download v1.7.0-beta.13 --repo "$repo" --dir installers/old/dist --pattern riftlauncher-1.7.0-beta.13-setup.exe --pattern latest.yml
-          gh release download v1.7.0 --repo "$repo" --dir installers/new/dist --pattern latest.yml
+          gh release download "v$OLD_VERSION" --repo "$REPO" --dir installers/old/dist --pattern "riftlauncher-$OLD_VERSION-setup.exe" --pattern latest.yml
+          gh release download "$RELEASE_TAG" --repo "$REPO" --dir installers/new/dist --pattern latest.yml
       - name: Run the ${{ matrix.scenario }} scenario
         timeout-minutes: 28
         env:
           EVIDENCE: ${{ runner.temp }}\evidence
-        run: node harness/windows/driver.mjs ${{ matrix.scenario }}
+          SCENARIO: ${{ matrix.scenario }}
+        run: node harness/windows/driver.mjs $env:SCENARIO
       - name: Upload the evidence
         if: always()
         uses: actions/upload-artifact@v4
