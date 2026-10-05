@@ -347,7 +347,9 @@ function seedProfile() {
 async function launch(label) {
   port += 1
   const out = openSync(join(EVIDENCE, `app-${label}.log`), "a")
-  const child = spawn(state.exe, [`--remote-debugging-port=${port}`], { detached: true, stdio: ["ignore", out, out] })
+  // PS_ENV, not this step's environment: the launcher passes its environment on to the installer,
+  // whose running-app check runs Windows PowerShell, which PowerShell 7's module path breaks.
+  const child = spawn(state.exe, [`--remote-debugging-port=${port}`], { detached: true, stdio: ["ignore", out, out], env: PS_ENV })
   child.unref()
   closeSync(out)
   log(`${label}: started the installed RiftLauncher.exe (pid ${child.pid}) with --remote-debugging-port=${port}, UPDATE unset`)
@@ -477,7 +479,7 @@ let trace = null
 function startTrace() {
   const file = join(EVIDENCE, "process-trace.jsonl")
   const stopFile = join(process.env.RUNNER_TEMP, "stop-trace")
-  const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", P.win, "-Action", "trace", "-Target", file, "-Name", stopFile], { stdio: "ignore", windowsHide: true, env: PS_ENV })
+  const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", P.win, "-Action", "trace", "-Target", file, "-Name", stopFile, "-Ignore", String(process.pid)], { stdio: "ignore", windowsHide: true, env: PS_ENV })
   trace = { file, stopFile, child }
 }
 async function stopTrace() {
@@ -657,9 +659,24 @@ function installState(label) {
   const exe = tryPs("ver", state.exe)
   writeJson(`reg-${label}.json`, reg)
   writeJson(`exe-${label}.json`, exe)
+  writeJson(`install-folder-${label}.json`, listing(state.installDir))
+  const shortcuts = shortcutState()
+  writeJson(`shortcuts-${label}.json`, shortcuts)
   const displayVersion = reg?.hkcuUninstall?.[0]?.values?.DisplayVersion ?? null
   log(`${label}: exe ProductVersion ${exe?.productVersion}, FileVersion ${exe?.fileVersion}, HKCU DisplayVersion ${displayVersion}, HKLM entries ${reg?.hklmUninstall?.length ?? "?"}`)
-  return { reg, exe, displayVersion }
+  return { reg, exe, displayVersion, shortcuts }
+}
+/** The per-user shortcuts the installer made, which an update is meant to keep. */
+function shortcutState() {
+  const places = { desktop: join(process.env.USERPROFILE, "Desktop", "RiftLauncher.lnk"), startMenu: join(APPDATA, "Microsoft", "Windows", "Start Menu", "Programs", "RiftLauncher.lnk") }
+  return Object.fromEntries(Object.entries(places).map(([k, file]) => {
+    try {
+      const st = statSync(file)
+      return [k, { exists: true, size: st.size, modified: st.mtime.toISOString(), sha256: createHash("sha256").update(readFileSync(file)).digest("hex") }]
+    } catch {
+      return [k, { exists: false }]
+    }
+  }))
 }
 /** The exe's FileVersion and the uninstall entry's DisplayVersion both say `v`. Its ProductVersion is 1.7.0.0 for the beta and the stable alike. */
 const isVersion = (s, v) => Boolean(s?.exe?.exists) && s.displayVersion === v && s.exe.fileVersion === v
@@ -680,6 +697,8 @@ async function installOld() {
   writeJson("exe-installed-old.json", exe)
   // The installer keeps a copy of itself there; the differential download of the next version needs it.
   report.install = { exitCode: r.status, installDir, perMachineEntries: reg.hklmUninstall.length, uninstall: reg.hkcuUninstall, installKey: reg.hkcuInstall, exe, updaterCache: listing(P.updaterCache) }
+  report.install.shortcuts = shortcutState()
+  writeJson("install-folder-installed-old.json", listing(installDir))
   log(`OLD installed per user in ${installDir}: ProductVersion ${exe.productVersion}, DisplayVersion ${reg.hkcuUninstall[0]?.values?.DisplayVersion}`)
 }
 

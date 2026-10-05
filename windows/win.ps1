@@ -20,7 +20,9 @@ param(
   [ValidateSet("shot", "windows", "minimize", "procs", "reg", "ver", "controls", "press", "close", "watch", "trace")]
   [string]$Action,
   [string]$Target = "",
-  [string]$Name = ""
+  [string]$Name = "",
+  # trace: the driver's own pid, whose PowerShell probes are left out
+  [int]$Ignore = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -338,6 +340,7 @@ switch ($Action) {
         $cmd = $null
         if ($isStart) {
           if ([string]$e.ProcessName -notmatch $interesting) { continue }
+          if ($Ignore -and [int]$e.ParentProcessID -eq $Ignore -and [string]$e.ProcessName -eq 'powershell.exe') { continue }
           $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$processId" -ErrorAction SilentlyContinue).CommandLine
           # The driver's own probes are PowerShell too; they are not part of the update.
           if ($cmd -and $cmd.Contains('\harness\windows\win.ps1')) { continue }
