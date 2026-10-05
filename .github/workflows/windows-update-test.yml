@@ -1,0 +1,174 @@
+name: Windows update test
+
+# The Windows half of RiftLauncher issue #615: the update from a 1.7.0 beta to the first stable
+# release, run for real on GitHub-hosted Windows runners against the two test releases of this
+# scratch repository. Manual only.
+#
+# build: the NSIS x64 installers of RiftLauncher v1.7.0-beta.13 (the tagged commit, at its own
+# version) and of dev at a pinned commit packaged as 1.7.0, both with their update feed pointed at
+# this repository. Each build's app-update.yml is checked before anything is uploaded, only the
+# Windows files go to the matching release, and the installers are kept as artifacts.
+#
+# test: one fresh runner per scenario, receiveBetaUpdates on, off and unset, and an update put off
+# then left waiting when the launcher closes. See windows/driver.mjs.
+on:
+  workflow_dispatch:
+    inputs:
+      skip_build:
+        description: Reuse the Windows files already on the two releases instead of building them again
+        type: boolean
+        default: false
+      scenarios:
+        description: Scenarios to run, as a JSON list
+        type: string
+        default: '["on", "off", "unset", "defer"]'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-update-test
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: ${{ !inputs.skip_build }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out RiftLauncher v1.7.0-beta.13 (read only)
+        uses: actions/checkout@v4
+        with:
+          repository: StratumServer/RiftLauncher
+          ref: 1549cdbb552194082b1ad4045d743e04980ae132
+          path: old
+          persist-credentials: false
+      - name: Check out RiftLauncher dev (read only)
+        uses: actions/checkout@v4
+        with:
+          repository: StratumServer/RiftLauncher
+          ref: 9013f93c40d65436b0a4d49dea510f0c89329c99
+          path: new
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            old/package-lock.json
+            new/package-lock.json
+      - name: Build the 1.7.0-beta.13 installer
+        working-directory: old
+        run: |
+          npm ci
+          npm run build
+          npx electron-builder --win nsis --x64 --publish never \
+            -c.publish.provider=github -c.publish.owner=StratumServer -c.publish.repo=riftlauncher-update-test
+      - name: Build the 1.7.0 installer
+        working-directory: new
+        run: |
+          npm ci
+          npm run build
+          npx electron-builder --win nsis --x64 --publish never \
+            -c.publish.provider=github -c.publish.owner=StratumServer -c.publish.repo=riftlauncher-update-test \
+            -c.extraMetadata.version=1.7.0
+      - name: Check that both update feeds point at this repository
+        run: |
+          check() {
+            local dir="$1" version="$2"
+            local feed="$dir/dist/win-unpacked/resources/app-update.yml"
+            echo "== $feed"; cat "$feed"
+            grep -qx 'provider: github' "$feed" && grep -qx 'owner: StratumServer' "$feed" && grep -qx 'repo: riftlauncher-update-test' "$feed" \
+              || { echo "::error::$feed does not name StratumServer/riftlauncher-update-test"; exit 1; }
+            echo "== $dir/dist/latest.yml"; cat "$dir/dist/latest.yml"
+            grep -qx "version: $version" "$dir/dist/latest.yml" || { echo "::error::$dir/dist/latest.yml is not $version"; exit 1; }
+            ls -l "$dir/dist/riftlauncher-$version-setup.exe" "$dir/dist/riftlauncher-$version-setup.exe.blockmap"
+          }
+          check old 1.7.0-beta.13
+          check new 1.7.0
+          for d in old new; do
+            node -p "'$d: electron ' + require('./$d/node_modules/electron/package.json').version + ', electron-builder ' + require('./$d/node_modules/electron-builder/package.json').version + ', electron-updater ' + require('./$d/node_modules/electron-updater/package.json').version"
+          done
+      - name: Upload the Windows files to the two test releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          repo=StratumServer/riftlauncher-update-test
+          gh release upload v1.7.0-beta.13 --repo "$repo" --clobber \
+            old/dist/riftlauncher-1.7.0-beta.13-setup.exe old/dist/riftlauncher-1.7.0-beta.13-setup.exe.blockmap old/dist/latest.yml
+          gh release upload v1.7.0 --repo "$repo" --clobber \
+            new/dist/riftlauncher-1.7.0-setup.exe new/dist/riftlauncher-1.7.0-setup.exe.blockmap new/dist/latest.yml
+          for tag in v1.7.0-beta.13 v1.7.0; do
+            gh release view "$tag" --repo "$repo" --json name,isPrerelease,assets --jq '"\(.name) prerelease=\(.isPrerelease)", (.assets[] | "  \(.name) \(.size)")'
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers
+          path: |
+            old/dist/riftlauncher-1.7.0-beta.13-setup.exe
+            old/dist/latest.yml
+            old/dist/win-unpacked/resources/app-update.yml
+            new/dist/riftlauncher-1.7.0-setup.exe
+            new/dist/latest.yml
+            new/dist/win-unpacked/resources/app-update.yml
+          if-no-files-found: error
+          retention-days: 7
+
+  test:
+    needs: build
+    if: ${{ always() && (needs.build.result == 'success' || (inputs.skip_build && needs.build.result == 'skipped')) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: ${{ fromJSON(inputs.scenarios) }}
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+      - name: Check out RiftLauncher dev's headless scripts (read only)
+        uses: actions/checkout@v4
+        with:
+          repository: StratumServer/RiftLauncher
+          ref: 9013f93c40d65436b0a4d49dea510f0c89329c99
+          path: rl-new
+          sparse-checkout: scripts/headless
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Take the installers built in this run
+        if: ${{ needs.build.result == 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: installers
+          path: installers
+      - name: Take the installers from the releases
+        if: ${{ needs.build.result == 'skipped' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          repo=StratumServer/riftlauncher-update-test
+          gh release download v1.7.0-beta.13 --repo "$repo" --dir installers/old/dist --pattern riftlauncher-1.7.0-beta.13-setup.exe --pattern latest.yml
+          gh release download v1.7.0 --repo "$repo" --dir installers/new/dist --pattern latest.yml
+      - name: Run the ${{ matrix.scenario }} scenario
+        timeout-minutes: 28
+        env:
+          EVIDENCE: ${{ runner.temp }}\evidence
+        run: node harness/windows/driver.mjs ${{ matrix.scenario }}
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenario-${{ matrix.scenario }}
+          path: ${{ runner.temp }}\evidence
+          if-no-files-found: warn
+          retention-days: 14
