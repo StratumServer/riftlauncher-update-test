@@ -96,6 +96,8 @@ const P = {
   updaterCache: join(LOCALAPPDATA, "riftlauncher-updater")
 }
 const INFO_LOG = join(P.userData, "Logs", "info.log")
+/** The launcher logs each level to its own file, and electron-updater's fallback to a full download is an error. */
+const ERROR_LOG = join(P.userData, "Logs", "error.log")
 /** One DevTools port per launch: the installer the launcher spawns inherits its listening socket and keeps the port while it runs. */
 let port = 9250
 
@@ -504,7 +506,15 @@ async function acceptAndDownload(label, offer, since) {
 function recordDifferential(label, text) {
   const lines = text.split(/\r?\n/)
   const blockmapLine = lines.find((l) => l.includes("Download block maps (old: ") && l.includes(`/v${OLD_VERSION}/riftlauncher-${OLD_VERSION}-setup.exe.blockmap`)) ?? null
-  const fallbackLine = lines.find((l) => l.includes("Cannot download differentially")) ?? null
+  // Log lines start with "[YYYY-MM-DD HH:MM:SS.mmm]", which sorts as text: only a fallback logged since this download's blockmap line counts.
+  const from = blockmapLine?.slice(0, 25) ?? ""
+  let errors = ""
+  try {
+    errors = readFileSync(ERROR_LOG, "utf8")
+  } catch {
+    // no error logged at all
+  }
+  const fallbackLine = [...lines, ...errors.split(/\r?\n/)].find((l) => l.includes("Cannot download differentially") && l.slice(0, 25) >= from) ?? null
   const sizeLine = lines.find((l) => /Full: .* To download: /.test(l)) ?? null
   const entry = { label, used: Boolean(blockmapLine) && !fallbackLine, blockmapLine: blockmapLine?.slice(0, 400) ?? null, fallbackLine: fallbackLine?.slice(0, 400) ?? null, sizeLine: sizeLine?.slice(0, 400) ?? null }
   ;(report.differential ??= []).push(entry)
