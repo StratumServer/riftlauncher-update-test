@@ -29,6 +29,14 @@
  *                         launcher and check that nothing was installed. Launch again, still the old
  *                         version, take the update that comes back, then as restart.
  *
+ * The cases where nothing may be offered (RiftLauncher PR 772):
+ *   off-no-offer, unset-no-offer  receiveBetaUpdates false or absent. Start the old build, wait
+ *                                 120 s and pass when no offer shows and the updater logged
+ *                                 "Update for version <old> is not available". Nothing is clicked.
+ *
+ * Every download records in report.json (differential) whether electron-updater fetched the old
+ * version's published blockmap and kept to the differential download.
+ *
  * The launcher is driven with RiftLauncher's own scripts/headless/cdp.mjs, checked out at the new
  * build's commit beside this repository. Only the launcher's update controls are clicked, by
  * selector: the action buttons of the update toasts, which carry aria-label = their text
@@ -56,7 +64,9 @@ const SCENARIOS = {
   defer: { beta: undefined, flow: "defer", silent: false },
   restart: { beta: undefined, flow: "restart", silent: true },
   "restart-on": { beta: true, flow: "restart", silent: true },
-  "close-after-download": { beta: undefined, flow: "close-after-download", silent: true }
+  "close-after-download": { beta: undefined, flow: "close-after-download", silent: true },
+  "off-no-offer": { beta: false, flow: "no-offer", silent: false },
+  "unset-no-offer": { beta: undefined, flow: "no-offer", silent: false }
 }
 const scenario = process.argv[2]
 if (!Object.hasOwn(SCENARIOS, scenario)) {
@@ -480,10 +490,25 @@ async function acceptAndDownload(label, offer, since) {
     return null
   }
   const toast = findToast(READY_TEXT)
+  recordDifferential(label, logSince(since))
   log(`${label}: download finished after ${((Date.now() - startedAt) / 1000).toFixed(1)} s: "${toast.text.replace(/\s+/g, " ").trim()}"`, { buttons: toast.buttons })
   desktopShot(`${label}-ready`)
   pageShot(`${label}-ready`)
   return toast
+}
+
+/**
+ * Whether the download was differential: electron-updater fetched the old version's published
+ * blockmap and did not fall back to the full file.
+ */
+function recordDifferential(label, text) {
+  const lines = text.split(/\r?\n/)
+  const blockmapLine = lines.find((l) => l.includes("Download block maps (old: ") && l.includes(`/v${OLD_VERSION}/riftlauncher-${OLD_VERSION}-setup.exe.blockmap`)) ?? null
+  const fallbackLine = lines.find((l) => l.includes("Cannot download differentially")) ?? null
+  const sizeLine = lines.find((l) => /Full: .* To download: /.test(l)) ?? null
+  const entry = { label, used: Boolean(blockmapLine) && !fallbackLine, blockmapLine: blockmapLine?.slice(0, 400) ?? null, fallbackLine: fallbackLine?.slice(0, 400) ?? null, sizeLine: sizeLine?.slice(0, 400) ?? null }
+  ;(report.differential ??= []).push(entry)
+  log(`${label}: ${entry.used ? "differential download" : "full download"}${sizeLine ? ` (${sizeLine.replace(/^.*\] /, "")})` : ""}${fallbackLine ? `: ${fallbackLine.replace(/^.*\] /, "").slice(0, 200)}` : ""}`)
 }
 
 function verifyPending() {
@@ -795,7 +820,8 @@ async function restartAndUpdate(ready) {
   // Windows that showed up during the handover from anything but the new launcher or the shell.
   const strangers = follow.windowsSeen.filter((w) => !/^(RiftLauncher|explorer) \(pid/.test(w))
   const otherCopies = (follow.processes ?? []).filter((p) => /^riftlauncher\.exe$/i.test(p.name) && !samePath(p.path, state.exe))
-  v.installerSilent = /with args: --updated,\/S,--force-run\s*$/.test(executing ?? "") && / --updated \/S --force-run\s*$/.test(installerCmd ?? "")
+  // RiftLauncher PR 770 adds /D=<install folder> after the silent flags.
+  v.installerSilent = /with args: --updated,\/S,--force-run(,\/D=[^,]+)?\s*$/.test(executing ?? "") && / --updated \/S --force-run( \/D=.+)?\s*$/.test(installerCmd ?? "")
   v.noInstallerWindow = follow.pages.length === 0 && strangers.length === 0
   v.restartedWithoutClick = Boolean(follow.newLauncher) && follow.presses.length === 0
   v.noPerMachineInstall = after.reg?.hkcuUninstall?.length === 1 && after.reg?.hklmUninstall?.length === 0 && after.programFiles.length === 0 && otherCopies.length === 0
@@ -933,6 +959,30 @@ async function deferScenario() {
   v.dataIntact = report.data.beforeQuitVsAfterQuit.intact && report.data.seededVsAfterQuit.kept && report.data.seededVsEnd.kept
 }
 
+/** Starts the old build and waits: nothing may be offered, and the updater must say so in its log. */
+async function noOfferScenario() {
+  const v = report.verdict
+  const since = logSize()
+  const s0 = snapshot("0-seeded")
+  const first = await launch("old")
+  report.oldVersionOverCdp = first.version
+  notePrompts("old")
+  const offer = await until(() => findToast(OFFER_TEXT), 120_000)
+  const text = logSince(since)
+  const notAvailableLine = text.split(/\r?\n/).find((l) => l.includes(`Update for version ${OLD_VERSION} is not available`)) ?? null
+  report.noOffer = { offer: offer ? offer.text.replace(/\s+/g, " ").trim() : null, notAvailableLine: notAvailableLine?.slice(0, 400) ?? null, updaterLog: updaterLines(text) }
+  v.notOffered = !offer
+  v.notAvailableLogged = Boolean(notAvailableLine)
+  log(`old: ${offer ? `offer shown: "${report.noOffer.offer}"` : "no offer within 120 s"}; updater: ${report.noOffer.notAvailableLine ?? "(no \"not available\" line)"}`, { updaterLog: report.noOffer.updaterLog })
+  desktopShot("old-after-wait")
+  pageShot("old-after-wait")
+  await closeLauncher("old")
+  const after = installState("after-wait")
+  v.stillOld = isVersion(after, OLD_VERSION)
+  report.data = { seededVsAfter: compare(s0, snapshot("1-after-wait")) }
+  v.dataIntact = report.data.seededVsAfter.kept
+}
+
 /** Closes the launcher the way its window's close button does, then watches what runs after it. */
 async function closeAndFollow(label) {
   const list = procs()
@@ -980,6 +1030,7 @@ async function main() {
   seedProfile()
   if (SPEC.flow === "defer") await deferScenario()
   else if (SPEC.flow === "close-after-download") await closeAfterDownloadScenario()
+  else if (SPEC.flow === "no-offer") await noOfferScenario()
   else await restartScenario()
 }
 
@@ -1004,7 +1055,9 @@ try {
   const expected =
     SPEC.flow === "defer"
       ? ["offeredFirst", "offeredAgain", "downloadedVerified", "dataIntact"]
-      : [
+      : SPEC.flow === "no-offer"
+        ? ["notOffered", "notAvailableLogged", "stillOld", "dataIntact"]
+        : [
           "offered",
           "downloadedVerified",
           ...(SPEC.flow === "close-after-download" ? ["nothingInstalledOnQuit", "nextLaunchStillOld", "offerCameBack", "secondDownloadVerified"] : []),
@@ -1015,7 +1068,7 @@ try {
         ]
   const missing = expected.filter((k) => v[k] !== true)
   if (SPEC.flow === "defer" && v.thirdLaunchVersion !== NEW_VERSION) missing.push("thirdLaunchVersion")
-  if (SPEC.flow !== "defer" && v.relaunchVersion !== NEW_VERSION) missing.push("relaunchVersion")
+  if (SPEC.flow !== "defer" && SPEC.flow !== "no-offer" && v.relaunchVersion !== NEW_VERSION) missing.push("relaunchVersion")
   if (missing.length) exitCode = 1
   report.finishedAt = new Date().toISOString()
   report.notAsExpected = missing
