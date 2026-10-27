@@ -7,12 +7,18 @@ name: Windows .NET missing-runtime probe
 # with the real Vintagestory.exe of the official installer. Manual only.
 on:
   workflow_dispatch:
+    inputs:
+      real_game_only:
+        description: Skip the WinForms probe and run the real Vintagestory.exe job alone
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   probe:
+    if: ${{ !inputs.real_game_only }}
     runs-on: windows-latest
     timeout-minutes: 20
     steps:

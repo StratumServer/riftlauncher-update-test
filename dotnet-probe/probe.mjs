@@ -36,8 +36,8 @@ for (const c of cases.filter((entry) => !only || only.includes(entry.name))) {
     exitCode = code
   })
   await new Promise((resolve) => setTimeout(resolve, WAIT_MS))
-  const windows = closed ? [] : execFileSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(import.meta.dirname, "windows.ps1"), String(child.pid)]).toString().trim().split(/\r?\n/).filter(Boolean)
-  execFileSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(import.meta.dirname, "screenshot.ps1"), join(outDir, `${c.name}.png`)])
+  const windows = closed ? [] : execFileSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(import.meta.dirname, "windows.ps1"), String(child.pid)], { timeout: 30_000 }).toString().trim().split(/\r?\n/).filter(Boolean)
+  execFileSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(import.meta.dirname, "screenshot.ps1"), join(outDir, `${c.name}.png`)], { timeout: 30_000 })
   results.push({ case: c.name, stillRunningAfter10s: !closed, exitCode, dataFolderAfter10s: readdirSync(dataPath), sentinelOnStderr: stderr.includes(SENTINEL), windows, stderrHead: stderr.slice(0, 800) })
   if (!closed) {
     child.kill()

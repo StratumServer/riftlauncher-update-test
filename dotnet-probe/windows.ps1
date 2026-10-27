@@ -7,14 +7,15 @@ public static class ProbeWindows {
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+  // InternalGetWindowText reads the title without sending the window a message, so a hung window cannot block it.
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int InternalGetWindowText(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
   public static List<string> For(uint target) {
     var found = new List<string>();
     EnumWindows((h, l) => {
       uint owner; GetWindowThreadProcessId(h, out owner);
       if (owner == target) {
-        var title = new StringBuilder(512); GetWindowText(h, title, 512);
+        var title = new StringBuilder(512); InternalGetWindowText(h, title, 512);
         var cls = new StringBuilder(256); GetClassName(h, cls, 256);
         found.Add(String.Format("visible={0} class={1} title={2}", IsWindowVisible(h), cls, title));
       }
