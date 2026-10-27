@@ -34,6 +34,27 @@
  *                                 120 s and pass when no offer shows and the updater logged
  *                                 "Update for version <old> is not available". Nothing is clicked.
  *
+ * The update of a copy of the install folder (RiftLauncher PR 770): Restart and update must install
+ * into the folder of the running copy, whatever the registry says. Each copies the installed folder
+ * to the workspace drive before the profile is seeded, and then runs like restart. They add the
+ * checks dFlagIsCopy (the installer's own command line ends in /D=<the copy>), filesUpdatedInCopy
+ * (the copy's exe is the new version) and relaunchedFromCopy (a launcher runs from the copy again),
+ * and record where the shortcuts point.
+ *   portable        a copy in "RiftLauncherPortable" that nothing knows: the registered install is
+ *                   uninstalled first, as a reinstalled Windows leaves a copy on another drive.
+ *                   Also noSecondInstall: no launcher in the registered or the default per-user
+ *                   folder, one registry entry, for the copy.
+ *   portable-space  the same in "Portable Games\RiftLauncher". electron-updater quotes a /D= argument
+ *                   that holds a space, which the NSIS template reads as part of the folder.
+ *   copy-beside     a copy in "RiftLauncherCopy" with the registered install left where it is. Also
+ *                   registeredRemoved, registryPointsAtCopy and shortcutsPointAtCopy.
+ * Whatever launcher the installer starts from another folder is closed before the copy is started
+ * again, since it holds the profile's single-instance lock.
+ *   registered-space  no copy: the old build is installed per user into "Programs\Rift Launcher",
+ *                     as a Windows account whose name holds a space gets. Adds dFlagIsInstall (the
+ *                     installer's command line ends in /D=<the install folder>) and records what
+ *                     sits beside the install folder afterwards.
+ *
  * Every download records in report.json (differential) whether electron-updater fetched the old
  * version's published blockmap and kept to the differential download.
  *
@@ -50,12 +71,15 @@
 import { spawn, spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import { appendFileSync, closeSync, cpSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
-import { basename, join } from "node:path"
+import { basename, join, parse } from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 
 /**
  * beta: receiveBetaUpdates in the seeded config.json, undefined for absent. silent: Restart and
  * update must install without a window and start the launcher again, with nothing clicked after it.
+ * copy: undefined to run the registered install, "unregistered" to run a copy of it that no registry
+ * entry knows, "beside" to run a copy left next to the registered install. folder: where the copy
+ * goes, under the root of the workspace drive.
  */
 const SCENARIOS = {
   on: { beta: true, flow: "restart", silent: false },
@@ -66,7 +90,11 @@ const SCENARIOS = {
   "restart-on": { beta: true, flow: "restart", silent: true },
   "close-after-download": { beta: undefined, flow: "close-after-download", silent: true },
   "off-no-offer": { beta: false, flow: "no-offer", silent: false },
-  "unset-no-offer": { beta: undefined, flow: "no-offer", silent: false }
+  "unset-no-offer": { beta: undefined, flow: "no-offer", silent: false },
+  portable: { beta: undefined, flow: "restart", silent: true, copy: "unregistered", folder: "RiftLauncherPortable" },
+  "portable-space": { beta: undefined, flow: "restart", silent: true, copy: "unregistered", folder: "Portable Games\\RiftLauncher" },
+  "copy-beside": { beta: undefined, flow: "restart", silent: true, copy: "beside", folder: "RiftLauncherCopy" },
+  "registered-space": { beta: undefined, flow: "restart", silent: true, installFolder: "Rift Launcher" }
 }
 const scenario = process.argv[2]
 if (!Object.hasOwn(SCENARIOS, scenario)) {
@@ -135,7 +163,7 @@ const report = {
   errors: [],
   steps: []
 }
-const state = { exe: null, installDir: null }
+const state = { exe: null, installDir: null, registeredDir: null }
 
 const secs = () => Number(((Date.now() - t0) / 1000).toFixed(1))
 function save() {
@@ -227,6 +255,8 @@ async function until(fn, timeoutMs, everyMs = 1000) {
 const samePath = (a, b) => typeof a === "string" && typeof b === "string" && a.toLowerCase() === b.toLowerCase()
 const procs = () => ps("procs") ?? []
 const launcherProcs = (list) => list.filter((p) => samePath(p.path, state.exe))
+/** RiftLauncher processes running from anywhere but state.exe, which a copy's update may have started. */
+const strayProcs = (list) => list.filter((p) => /^riftlauncher\.exe$/i.test(p.name) && !samePath(p.path, state.exe))
 const mainOf = (list) => launcherProcs(list).find((p) => !/--type=/.test(p.cmd ?? ""))
 const isPendingInstaller = (p) => /\\riftlauncher-updater\\pending\\/i.test(p.path ?? "")
 
@@ -735,13 +765,13 @@ function installState(label) {
   log(`${label}: exe ProductVersion ${exe?.productVersion}, FileVersion ${exe?.fileVersion}, HKCU DisplayVersion ${displayVersion} (${reg?.hkcuUninstall?.length ?? "?"} HKCU entries), HKLM entries ${reg?.hklmUninstall?.length ?? "?"}, Program Files copies ${programFiles.length}`)
   return { reg, exe, displayVersion, shortcuts, programFiles }
 }
-/** The per-user shortcuts the installer made, which an update is meant to keep. */
-function shortcutState() {
+/** The per-user shortcuts the installer made, which an update is meant to keep. The copy scenarios also read where they point. */
+function shortcutState(withTargets = Boolean(SPEC.copy)) {
   const places = { desktop: join(process.env.USERPROFILE, "Desktop", "RiftLauncher.lnk"), startMenu: join(APPDATA, "Microsoft", "Windows", "Start Menu", "Programs", "RiftLauncher.lnk") }
   return Object.fromEntries(Object.entries(places).map(([k, file]) => {
     try {
       const st = statSync(file)
-      return [k, { exists: true, size: st.size, modified: st.mtime.toISOString(), sha256: createHash("sha256").update(readFileSync(file)).digest("hex") }]
+      return [k, { exists: true, size: st.size, modified: st.mtime.toISOString(), sha256: createHash("sha256").update(readFileSync(file)).digest("hex"), ...(withTargets && { target: tryPs("lnk", file)?.targetPath ?? null }) }]
     } catch {
       return [k, { exists: false }]
     }
@@ -754,8 +784,10 @@ const isVersion = (s, v) => Boolean(s?.exe?.exists) && s.displayVersion === v &&
 
 async function installOld() {
   const started = Date.now()
-  const r = spawnSync(P.oldSetup, ["/S"], { timeout: 300_000 })
-  log(`installed ${basename(P.oldSetup)} with /S: exit ${r.status ?? r.error?.message} after ${((Date.now() - started) / 1000).toFixed(1)} s`)
+  // NSIS wants /D= last and unquoted, even with a space in it, so the arguments go as they are.
+  const args = SPEC.installFolder ? ["/S", `/D=${join(LOCALAPPDATA, "Programs", SPEC.installFolder)}`] : ["/S"]
+  const r = spawnSync(P.oldSetup, args, { timeout: 300_000, windowsVerbatimArguments: Boolean(SPEC.installFolder) })
+  log(`installed ${basename(P.oldSetup)} with ${args.join(" ")}: exit ${r.status ?? r.error?.message} after ${((Date.now() - started) / 1000).toFixed(1)} s`)
   const reg = ps("reg")
   writeJson("reg-installed-old.json", reg)
   const installDir = reg?.hkcuInstall?.[0]?.values?.InstallLocation ?? reg?.hkcuUninstall?.[0]?.values?.InstallLocation
@@ -769,6 +801,35 @@ async function installOld() {
   report.install.shortcuts = shortcutState()
   writeJson("install-folder-installed-old.json", listing(installDir))
   log(`OLD installed per user in ${installDir}: ProductVersion ${exe.productVersion}, DisplayVersion ${reg.hkcuUninstall[0]?.values?.DisplayVersion}`)
+}
+
+/**
+ * Runs the scenario from a copy of the installed folder, made before the profile is seeded. For
+ * "unregistered" the registered install is then uninstalled, which leaves the copy as a Windows
+ * reinstall would leave one that kept its drive. From here on state.exe and state.installDir are the
+ * copy's, and state.registeredDir is the install's.
+ */
+async function placeCopy() {
+  const registered = state.installDir
+  const copy = join(parse(WS).root, SPEC.folder)
+  cpSync(registered, copy, { recursive: true })
+  Object.assign(state, { registeredDir: registered, installDir: copy, exe: join(copy, "RiftLauncher.exe") })
+  report.copy = { kind: SPEC.copy, registeredDir: registered, copyDir: copy }
+  log(`copied ${registered} to ${copy}`)
+  installState("copy-placed")
+  if (SPEC.copy !== "unregistered") return
+
+  // The uninstaller copies itself to %TEMP% and returns at once, so wait for what it removes. It
+  // takes the registry entry last. PS_ENV for the same reason as in launch().
+  const registeredExe = join(registered, "RiftLauncher.exe")
+  const r = spawnSync(join(registered, "Uninstall RiftLauncher.exe"), ["/currentuser", "/S"], { stdio: "ignore", timeout: 60_000, env: PS_ENV })
+  if (r.error) throw new Error(`running the registered install's uninstaller failed: ${r.error.message}`)
+  log(`ran the registered install's uninstaller with /S: exit ${r.status}`)
+  const gone = await until(() => !existsSync(registeredExe) && ps("reg").hkcuUninstall.length === 0, 120_000, 2000)
+  if (!gone) throw new Error(`the registered install was still there 120 s after its uninstaller ran: ${registeredExe} ${existsSync(registeredExe) ? "exists" : "is gone"}, ${tryPs("reg")?.hkcuUninstall?.length ?? "?"} HKCU entries`)
+  if (!existsSync(state.exe)) throw new Error(`the uninstaller of ${registered} removed the copy's ${state.exe}`)
+  report.copy.registeredAfterUninstall = listing(registered)
+  installState("copy-unregistered")
 }
 
 async function restartScenario() {
@@ -828,15 +889,71 @@ async function restartAndUpdate(ready) {
   const traced = follow.processTrace.find((e) => e.kind === "start" && /\\riftlauncher-updater\\pending\\/i.test(e.cmd ?? ""))
   const installerCmd = follow.installer?.cmd ?? traced?.cmd ?? null
   // Windows that showed up during the handover from anything but the new launcher or the shell.
-  const strangers = follow.windowsSeen.filter((w) => !/^(RiftLauncher|explorer) \(pid/.test(w))
+  // A copy's update can leave the shell showing a dialog of its own (a shortcut to an exe that is gone), which a player would see.
+  const strangers = follow.windowsSeen.filter((w) => !(SPEC.copy ? /^RiftLauncher \(pid|^explorer \(pid \d+\) \| (?!#32770 \|)/ : /^(RiftLauncher|explorer) \(pid/).test(w))
   const otherCopies = (follow.processes ?? []).filter((p) => /^riftlauncher\.exe$/i.test(p.name) && !samePath(p.path, state.exe))
-  // RiftLauncher PR 770 adds /D=<install folder> after the silent flags.
-  v.installerSilent = /with args: --updated,\/S,--force-run(,\/D=[^,]+)?\s*$/.test(executing ?? "") && / --updated \/S --force-run( \/D=.+)?\s*$/.test(installerCmd ?? "")
+  // RiftLauncher PR 770 adds /D=<install folder> after the silent flags, in quotes on a command line when the folder has a space.
+  v.installerSilent = /with args: --updated,\/S,--force-run(,\/D=[^,]+)?\s*$/.test(executing ?? "") && / --updated \/S --force-run( "?\/D=.+)?\s*$/.test(installerCmd ?? "")
   v.noInstallerWindow = follow.pages.length === 0 && strangers.length === 0
   v.restartedWithoutClick = Boolean(follow.newLauncher) && follow.presses.length === 0
   v.noPerMachineInstall = after.reg?.hkcuUninstall?.length === 1 && after.reg?.hklmUninstall?.length === 0 && after.programFiles.length === 0 && otherCopies.length === 0
-  follow.silentCheck = { executing, installerCmd, strangers, otherCopies, programFiles: after.programFiles }
+  follow.silentCheck = { executing, installerCmd, strangers, explorerWindows: follow.windowsSeen.filter((w) => /^explorer \(pid/.test(w)), otherCopies, programFiles: after.programFiles }
   log(`restart: installer ${installerCmd ?? "(not seen)"}; installer windows ${follow.pages.length}; other windows ${strangers.join(" ; ") || "none"}; presses ${follow.presses.length}; old gone after ${follow.oldGoneAfterS} s, installer exited after ${follow.installerExitAfterS} s, new launcher after ${follow.newLauncher?.seenAfterS ?? "-"} s`)
+  if (SPEC.copy) await checkCopy(follow, after, executing, installerCmd)
+  if (SPEC.installFolder) {
+    const nsisD = /\/D=(.*)$/i.exec(installerCmd ?? "")?.[1]
+    v.dFlagIsInstall = nsisD !== undefined && samePath(nsisD.replace(/[\\/]+$/, ""), state.installDir.replace(/[\\/]+$/, ""))
+    const parent = join(state.installDir, "..")
+    report.besideInstall = existsSync(parent) ? readdirSync(parent) : null
+    log(`registered-space: installer command line ends with ${nsisD === undefined ? "no /D=" : `/D=${nsisD}`}; beside the install folder: ${JSON.stringify(report.besideInstall).slice(0, 600)}`)
+  }
+}
+
+/**
+ * The checks of a copy's update (RiftLauncher PR 770): the installer was given the copy's folder
+ * and the copy is what ended up new and running. Then whatever launcher the installer started from
+ * elsewhere is recorded and closed, since it holds the profile's single-instance lock and the copy
+ * could not start again.
+ */
+async function checkCopy(follow, after, executing, installerCmd) {
+  const v = report.verdict
+  const folder = (s) => String(s ?? "").replace(/[\\/]+$/, "")
+  // The launcher logs its argument list before Node quotes anything, so the installer's own command
+  // line is what to read. The NSIS template takes everything after the first /D= to the end of it
+  // (multiUser.nsh GetDParameter), closing quote included when the folder has a space.
+  const dArg = /,\/D=(.*?)\s*$/.exec(executing ?? "")?.[1]
+  const nsisD = /\/D=(.*)$/i.exec(installerCmd ?? "")?.[1]
+  const given = (d) => (d === undefined ? "no /D=" : `/D=${d}`)
+  v.dFlagIsCopy = nsisD !== undefined && samePath(folder(nsisD), folder(state.installDir))
+  v.filesUpdatedInCopy = after.exe?.fileVersion === NEW_VERSION
+  v.relaunchedFromCopy = Boolean(follow.newLauncher)
+
+  // A probe that fails must not lose the evidence: the launcher from the other folder is still running.
+  const found = strayProcs((await until(() => procs(), 30_000)) ?? tryPs("procs") ?? [])
+  const versions = Object.fromEntries([...new Set(found.map((p) => p.path).filter(Boolean))].map((x) => [x, tryPs("ver", x)?.fileVersion ?? null]))
+  const strays = found.map((p) => ({ ...p, version: versions[p.path] ?? null }))
+  const defaultExe = tryPs("ver", join(LOCALAPPDATA, "Programs", "RiftLauncher", "RiftLauncher.exe"))
+  const registeredExe = tryPs("ver", join(state.registeredDir, "RiftLauncher.exe"))
+  report.secondInstall = { launcherDArg: dArg ?? null, installerDArg: nsisD ?? null, defaultFolderExe: defaultExe, registeredFolderExe: registeredExe, strays }
+  const entries = after.reg?.hkcuUninstall ?? []
+  const location = after.reg?.hkcuInstall?.[0]?.values?.InstallLocation
+  const registeredForCopy = entries.length === 1 && samePath(folder(location), folder(state.installDir))
+  if (SPEC.copy === "unregistered") {
+    v.noSecondInstall = defaultExe?.exists === false && registeredExe?.exists === false && strays.length === 0 && registeredForCopy
+  } else {
+    v.registeredRemoved = registeredExe?.exists === false
+    v.registryPointsAtCopy = registeredForCopy && entries[0].values?.DisplayVersion === NEW_VERSION
+    v.shortcutsPointAtCopy = ["desktop", "startMenu"].every((k) => after.shortcuts[k].exists && samePath(after.shortcuts[k].target, state.exe))
+  }
+  log(`copy: launcher logged ${given(dArg)}; installer command line ends with ${installerCmd ? given(nsisD) : "(not seen)"}; default folder launcher ${defaultExe?.exists ? defaultExe.fileVersion : "absent"}; registered folder launcher ${registeredExe?.exists ? registeredExe.fileVersion : "absent"}; ${strays.length} launcher process(es) from another folder; shortcuts ${Object.entries(after.shortcuts).map(([k, s]) => `${k} -> ${s.target ?? "(absent)"}`).join(", ")}`, report.secondInstall)
+
+  const mains = strays.filter((p) => !/--type=/.test(p.cmd ?? ""))
+  for (const p of mains) log(`copy: asked the launcher of ${p.path} (pid ${p.pid}) to close: ${JSON.stringify(tryPs("close", String(p.pid)))}`)
+  if (strays.length && !(await until(() => strayProcs(procs()).length === 0, 60_000))) {
+    fail("a launcher from another folder was still running 60 s after its window was asked to close; killing it")
+    for (const p of strayProcs(tryPs("procs") ?? [])) spawnSync("taskkill", ["/PID", String(p.pid), "/T", "/F"], { windowsHide: true })
+    report.secondInstall.killed = true
+  }
 }
 
 /** Closes the restarted launcher, checks the profile, then starts the installed exe once more. */
@@ -1037,6 +1154,7 @@ async function main() {
   }
   startTrace()
   await installOld()
+  if (SPEC.copy) await placeCopy()
   seedProfile()
   if (SPEC.flow === "defer") await deferScenario()
   else if (SPEC.flow === "close-after-download") await closeAfterDownloadScenario()
@@ -1074,6 +1192,10 @@ try {
           "installed",
           "restartedOnNew",
           ...(SPEC.silent ? ["installerSilent", "noInstallerWindow", "restartedWithoutClick", "noPerMachineInstall"] : []),
+          ...(SPEC.copy ? ["dFlagIsCopy", "filesUpdatedInCopy", "relaunchedFromCopy"] : []),
+          ...(SPEC.copy === "unregistered" ? ["noSecondInstall"] : []),
+          ...(SPEC.copy === "beside" ? ["registeredRemoved", "registryPointsAtCopy", "shortcutsPointAtCopy"] : []),
+          ...(SPEC.installFolder ? ["dFlagIsInstall"] : []),
           "dataIntact"
         ]
   const missing = expected.filter((k) => v[k] !== true)

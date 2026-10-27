@@ -13,7 +13,9 @@ name: Windows update test
 # The defaults are the beta to stable runs of RiftLauncher issue 615: v1.7.0-beta.13 to dev
 # packaged as 1.7.0. The silent Restart and update of issue 668 ran with old_sha and new_sha both
 # f8e0d1ba4369780dcba148b4475ac137768a4aee, old_version 1.7.0, new_version 1.7.1, release_tag v1.7.1
-# and the scenarios restart, restart-on and close-after-download.
+# and the scenarios restart, restart-on and close-after-download. The update of a copy of the
+# install folder (RiftLauncher PR 770) runs the scenarios portable, portable-space and
+# copy-beside; their control installs an old build from before that change, and runs portable alone.
 on:
   workflow_dispatch:
     inputs:

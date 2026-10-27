@@ -10,6 +10,7 @@
 #   procs                                 launcher, installer, uninstaller and running-app-check processes
 #   reg                                   the launcher's uninstall and install registry entries
 #   ver     -Target <exe>                 version resource, size and hash of a file
+#   lnk     -Target <lnk>                 where a shortcut points
 #   controls -Target <pid>                every control of every visible top-level window of one process
 #   press   -Target <pid> -Name <button>  press one installer button: Next >, Install or Finish only
 #   close   -Target <pid>                 send WM_CLOSE to that process's visible top-level windows
@@ -17,7 +18,7 @@
 #   trace   -Target <jsonl file> -Name <stop file>   process starts and stops, with exit codes
 param(
   [Parameter(Mandatory = $true)]
-  [ValidateSet("shot", "windows", "minimize", "procs", "reg", "ver", "controls", "press", "close", "watch", "trace")]
+  [ValidateSet("shot", "windows", "minimize", "procs", "reg", "ver", "lnk", "controls", "press", "close", "watch", "trace")]
   [string]$Action,
   [string]$Target = "",
   [string]$Name = "",
@@ -299,6 +300,14 @@ switch ($Action) {
       fileDescription = $vi.FileDescription
       sha256 = $hash
     })
+  }
+  "lnk" {
+    if (-not (Test-Path -LiteralPath $Target)) {
+      Out-Json ([ordered]@{ path = $Target; exists = $false })
+      break
+    }
+    $link = (New-Object -ComObject WScript.Shell).CreateShortcut($Target)
+    Out-Json ([ordered]@{ path = $Target; exists = $true; targetPath = $link.TargetPath; arguments = $link.Arguments; workingDirectory = $link.WorkingDirectory; iconLocation = $link.IconLocation })
   }
   "controls" {
     Use-Native
