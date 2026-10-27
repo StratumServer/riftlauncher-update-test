@@ -63,6 +63,8 @@ jobs:
           $exe = (Get-ChildItem C:\vsx -Recurse -Filter Vintagestory.exe | Select-Object -First 1).FullName
           "VS_EXE=$exe" | Out-File $env:GITHUB_ENV -Append
           Write-Host "exe: $exe"
+          if (-not $exe) { exit 1 }
+          exit 0
       - name: Read the executable's subsystem and runtime
         shell: pwsh
         run: |
