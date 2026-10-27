@@ -47,8 +47,12 @@ for (const c of cases.filter((entry) => !only || only.includes(entry.name))) {
   powershell("screenshot.ps1", join(outDir, `${c.name}.png`))
   results.push({ case: c.name, stillRunningAfter10s: !closed, exitCode, dataFolderAfter10s: readdirSync(dataPath), sentinelOnStderr: stderr.includes(SENTINEL), windows, stderrHead: stderr.slice(0, 800) })
   if (!closed) {
-    child.kill()
+    // The whole tree: a running game can start processes of its own that hold the pipes open.
+    try {
+      execFileSync("taskkill", ["/T", "/F", "/PID", String(child.pid)], { timeout: 30_000 })
+    } catch {}
     await new Promise((resolve) => setTimeout(resolve, 1_000))
   }
 }
 console.log(JSON.stringify(results, null, 2))
+process.exit(0)

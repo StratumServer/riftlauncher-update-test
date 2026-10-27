@@ -79,15 +79,11 @@ jobs:
           $subsystem = [BitConverter]::ToUInt16($bytes, $pe + 24 + 68)
           Write-Host "PE subsystem: $subsystem (2 = Windows GUI, 3 = console)"
           Get-Content ([System.IO.Path]::ChangeExtension($env:VS_EXE, 'runtimeconfig.json'))
-      - name: Control, the runtime present
-        shell: pwsh
-        env:
-          PROBE_CASES: launcher-as-is
-        run: node dotnet-probe/probe.mjs "$env:VS_EXE" "$PWD\results\control" | Tee-Object results-control.json
       - name: Ask for a runtime that does not exist
         shell: pwsh
         run: |
           $path = [System.IO.Path]::ChangeExtension($env:VS_EXE, 'runtimeconfig.json')
+          Copy-Item $path "$env:VS_EXE.runtimeconfig.bak"
           $config = Get-Content $path -Raw | ConvertFrom-Json
           if ($config.runtimeOptions.framework) { $config.runtimeOptions.framework.version = "99.0.0" }
           foreach ($framework in @($config.runtimeOptions.frameworks)) { if ($framework) { $framework.version = "99.0.0" } }
@@ -96,6 +92,16 @@ jobs:
       - name: Run the probe
         shell: pwsh
         run: node dotnet-probe/probe.mjs "$env:VS_EXE" "$PWD\results\missing" | Tee-Object results-missing.json
+      - name: Put the real runtimeconfig back
+        shell: pwsh
+        run: Copy-Item "$env:VS_EXE.runtimeconfig.bak" ([System.IO.Path]::ChangeExtension($env:VS_EXE, 'runtimeconfig.json')) -Force
+      - name: Control, the runtime present
+        timeout-minutes: 3
+        continue-on-error: true
+        shell: pwsh
+        env:
+          PROBE_CASES: launcher-as-is
+        run: node dotnet-probe/probe.mjs "$env:VS_EXE" "$PWD\results\control" | Tee-Object results-control.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
