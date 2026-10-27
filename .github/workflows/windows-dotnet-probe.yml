@@ -1,0 +1,41 @@
+name: Windows .NET missing-runtime probe
+
+# What a framework-dependent .NET GUI app does when its runtime is missing and it is started the
+# way RiftLauncher starts Vintage Story (spawn with windowsHide true). The probe is a WinForms
+# app whose runtimeconfig asks for a framework version that does not exist, so the .NET host
+# takes its missing-runtime path without anything being uninstalled. Manual only.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Build the probe app
+        shell: pwsh
+        run: |
+          dotnet new winforms -n Probe -o probe --framework net8.0
+          dotnet publish probe -c Release -o out
+          $config = Get-Content out/Probe.runtimeconfig.json -Raw | ConvertFrom-Json
+          if ($config.runtimeOptions.framework) { $config.runtimeOptions.framework.version = "99.0.0" }
+          foreach ($framework in @($config.runtimeOptions.frameworks)) { if ($framework) { $framework.version = "99.0.0" } }
+          $config | ConvertTo-Json -Depth 10 | Set-Content out/Probe.runtimeconfig.json
+          Get-Content out/Probe.runtimeconfig.json
+      - name: Run the probe
+        shell: pwsh
+        run: node dotnet-probe/probe.mjs "$PWD\out\Probe.exe" "$PWD\results" | Tee-Object results.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probe-results
+          path: |
+            results
+            results.json
