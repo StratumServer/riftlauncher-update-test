@@ -3,11 +3,12 @@
 // process is still alive after a while, which windows it owns, and whether stderr carries the
 // .NET host's missing-runtime sentence.
 import { execFileSync, spawn } from "node:child_process"
-import { mkdirSync } from "node:fs"
-import { join } from "node:path"
+import { mkdirSync, readdirSync } from "node:fs"
+import { dirname, join } from "node:path"
 
 const [exe, outDir] = process.argv.slice(2)
 mkdirSync(outDir, { recursive: true })
+const dataRoot = join(outDir, "data")
 const SENTINEL = "You must install or update .NET to run this application."
 const WAIT_MS = 10_000
 
@@ -17,9 +18,14 @@ const cases = [
   { name: "launcher-with-DOTNET_DISABLE_GUI_ERRORS", windowsHide: true, env: { DOTNET_DISABLE_GUI_ERRORS: "1" } }
 ]
 
+// PROBE_CASES narrows the run to a comma-separated list of case names.
+const only = process.env.PROBE_CASES?.split(",")
 const results = []
-for (const c of cases) {
-  const child = spawn(exe, ["--dataPath=C:\\probe-data"], { env: { ...process.env, ...c.env }, shell: false, windowsHide: c.windowsHide })
+for (const c of cases.filter((entry) => !only || only.includes(entry.name))) {
+  // An empty data folder per case, as a new Installation's is, so what the game writes there shows.
+  const dataPath = join(dataRoot, c.name)
+  mkdirSync(dataPath, { recursive: true })
+  const child = spawn(exe, [`--dataPath=${dataPath}`, ""], { env: { ...process.env, ...c.env }, cwd: dirname(exe), shell: false, windowsHide: c.windowsHide })
   let stderr = ""
   let exitCode = null
   let closed = false
@@ -32,7 +38,7 @@ for (const c of cases) {
   await new Promise((resolve) => setTimeout(resolve, WAIT_MS))
   const windows = closed ? [] : execFileSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(import.meta.dirname, "windows.ps1"), String(child.pid)]).toString().trim().split(/\r?\n/).filter(Boolean)
   execFileSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(import.meta.dirname, "screenshot.ps1"), join(outDir, `${c.name}.png`)])
-  results.push({ case: c.name, stillRunningAfter10s: !closed, exitCode, sentinelOnStderr: stderr.includes(SENTINEL), windows, stderrHead: stderr.slice(0, 800) })
+  results.push({ case: c.name, stillRunningAfter10s: !closed, exitCode, dataFolderAfter10s: readdirSync(dataPath), sentinelOnStderr: stderr.includes(SENTINEL), windows, stderrHead: stderr.slice(0, 800) })
   if (!closed) {
     child.kill()
     await new Promise((resolve) => setTimeout(resolve, 1_000))

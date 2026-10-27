@@ -3,7 +3,8 @@ name: Windows .NET missing-runtime probe
 # What a framework-dependent .NET GUI app does when its runtime is missing and it is started the
 # way RiftLauncher starts Vintage Story (spawn with windowsHide true). The probe is a WinForms
 # app whose runtimeconfig asks for a framework version that does not exist, so the .NET host
-# takes its missing-runtime path without anything being uninstalled. Manual only.
+# takes its missing-runtime path without anything being uninstalled. The second job does the same
+# with the real Vintagestory.exe of the official installer. Manual only.
 on:
   workflow_dispatch:
 
@@ -39,3 +40,59 @@ jobs:
           path: |
             results
             results.json
+
+  vintagestory:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the official installer
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://cdn.vintagestory.at/gamefiles/stable/vs_install_win-x64_1.22.7.exe -OutFile vs.exe
+          (Get-FileHash vs.exe -Algorithm MD5).Hash
+      - name: Install the game files
+        shell: pwsh
+        run: |
+          choco install innoextract -y --no-progress
+          innoextract -e -s -d C:\vsx vs.exe
+          if ($LASTEXITCODE -ne 0 -or -not (Get-ChildItem C:\vsx -Recurse -Filter Vintagestory.exe)) {
+            Write-Host "innoextract could not read it, running the installer silently"
+            Start-Process vs.exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/NOICONS','/DIR=C:\vsx\app' -Wait
+          }
+          $exe = (Get-ChildItem C:\vsx -Recurse -Filter Vintagestory.exe | Select-Object -First 1).FullName
+          "VS_EXE=$exe" | Out-File $env:GITHUB_ENV -Append
+          Write-Host "exe: $exe"
+      - name: Read the executable's subsystem and runtime
+        shell: pwsh
+        run: |
+          $bytes = [System.IO.File]::ReadAllBytes($env:VS_EXE)
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          $subsystem = [BitConverter]::ToUInt16($bytes, $pe + 24 + 68)
+          Write-Host "PE subsystem: $subsystem (2 = Windows GUI, 3 = console)"
+          Get-Content ([System.IO.Path]::ChangeExtension($env:VS_EXE, 'runtimeconfig.json'))
+      - name: Control, the runtime present
+        shell: pwsh
+        env:
+          PROBE_CASES: launcher-as-is
+        run: node dotnet-probe/probe.mjs "$env:VS_EXE" "$PWD\results\control" | Tee-Object results-control.json
+      - name: Ask for a runtime that does not exist
+        shell: pwsh
+        run: |
+          $path = [System.IO.Path]::ChangeExtension($env:VS_EXE, 'runtimeconfig.json')
+          $config = Get-Content $path -Raw | ConvertFrom-Json
+          if ($config.runtimeOptions.framework) { $config.runtimeOptions.framework.version = "99.0.0" }
+          foreach ($framework in @($config.runtimeOptions.frameworks)) { if ($framework) { $framework.version = "99.0.0" } }
+          $config | ConvertTo-Json -Depth 10 | Set-Content $path
+          Get-Content $path
+      - name: Run the probe
+        shell: pwsh
+        run: node dotnet-probe/probe.mjs "$env:VS_EXE" "$PWD\results\missing" | Tee-Object results-missing.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vintagestory-results
+          path: |
+            results
+            results-control.json
+            results-missing.json
